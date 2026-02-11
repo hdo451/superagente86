@@ -94,33 +94,74 @@ class DeliveryAgent:
 
     def _render_report(self, report: Report) -> str:
         lines = []
-        lines.append(f"Reporte: {report.generated_at.strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"📰 REPORTE DE NEWSLETTERS")
+        lines.append(f"   {report.generated_at.strftime('%Y-%m-%d %H:%M')}")
         lines.append("")
         
         if report.executive_summary_es or report.executive_summary_en:
-            lines.append("━━━ RESUMEN ━━━")
-            lines.append(f"ES: {report.executive_summary_es}")
-            lines.append(f"EN: {report.executive_summary_en}")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            lines.append("📊 RESUMEN EJECUTIVO")
+            lines.append(f"   {report.executive_summary_es}")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             lines.append("")
         
-        for i, item in enumerate(report.items, 1):
-            lines.extend(self._render_item(item, i))
+        # Group by priority
+        high_items = [i for i in report.items if i.priority == "high"]
+        medium_items = [i for i in report.items if i.priority == "medium"]
+        low_items = [i for i in report.items if i.priority == "low"]
+        
+        idx = 1
+        if high_items:
+            lines.append("🔴 ALTA PRIORIDAD")
+            lines.append("─" * 40)
+            for item in high_items:
+                lines.extend(self._render_item(item, idx))
+                idx += 1
+            lines.append("")
+        
+        if medium_items:
+            lines.append("🟡 MEDIA PRIORIDAD")
+            lines.append("─" * 40)
+            for item in medium_items:
+                lines.extend(self._render_item(item, idx))
+                idx += 1
+            lines.append("")
+        
+        if low_items:
+            lines.append("🟢 BAJA PRIORIDAD / APPS")
+            lines.append("─" * 40)
+            for item in low_items:
+                lines.extend(self._render_item(item, idx))
+                idx += 1
         
         return "\n".join(lines)
 
     def _render_item(self, item: ReportItem, index: int) -> List[str]:
+        # Build tag indicators
+        indicators = []
+        if item.has_company_news:
+            indicators.append("🏢")
+        if item.has_video:
+            indicators.append("🎬")
+        if item.has_prompt:
+            indicators.append("💡")
+        
+        indicator_str = " ".join(indicators) + " " if indicators else ""
+        
         lines = [
-            f"\n{index}. {item.topic.upper()}",
-            f"   [Priority: {item.priority.upper()} | Tags: {', '.join(item.tags)}]",
-            "",
-            f"   {item.summary_es}",
-            "",
+            f"",
+            f"{index}. {indicator_str}{item.topic.upper()}",
+            f"   Tags: {', '.join(item.tags)}",
+            f"",
+            f"   {item.summary}",
+            f"",
         ]
         
-        # Render sources compactly
+        # Render sources with their special content
         for source in item.sources:
             lines.extend(self._render_source(source))
         
+        lines.append("")
         return lines
 
     def _render_source(self, source: ReportSource) -> List[str]:
@@ -128,17 +169,38 @@ class DeliveryAgent:
         time_str = source.received_at.strftime("%m-%d %H:%M")
         
         lines = [
-            f"   📧 {sender_short} ({time_str})",
-            f"      └─ {source.summary_es[:100]}..." if len(source.summary_es) > 100 else f"      └─ {source.summary_es}",
+            f"   ┌─ 📧 {sender_short} ({time_str})",
+            f"   │  {source.summary}",
         ]
         
-        if source.extracted_links:
-            links_str = " | ".join(source.extracted_links[:3])
-            if len(source.extracted_links) > 3:
-                links_str += f" + {len(source.extracted_links) - 3} more"
-            lines.append(f"      🔗 {links_str}")
+        # Show prompt of the day COMPLETE
+        if source.prompt_of_day:
+            lines.append(f"   │")
+            lines.append(f"   │  💡 PROMPT OF THE DAY:")
+            lines.append(f"   │  \"{source.prompt_of_day}\"")
         
-        lines.append(f"      📌 {source.email_link}")
+        # Show company news
+        if source.company_news:
+            lines.append(f"   │")
+            lines.append(f"   │  🏢 NOTICIAS: {', '.join(source.company_news)}")
+        
+        # Show video links prominently
+        if source.video_links:
+            lines.append(f"   │")
+            lines.append(f"   │  🎬 VIDEOS:")
+            for vlink in source.video_links[:3]:
+                lines.append(f"   │     → {vlink}")
+        
+        # Show apps to try (secondary)
+        if source.app_mentions:
+            lines.append(f"   │  📱 Apps: {', '.join(source.app_mentions)}")
+        
+        # Other links (compact)
+        other_links = [l for l in source.extracted_links if l not in source.video_links][:3]
+        if other_links:
+            lines.append(f"   │  🔗 Links: {' | '.join(other_links[:2])}{'...' if len(other_links) > 2 else ''}")
+        
+        lines.append(f"   └─ 📌 Email: {source.email_link}")
         lines.append("")
         
         return lines
