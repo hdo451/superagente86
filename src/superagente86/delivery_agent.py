@@ -10,14 +10,8 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from .analysis_agent import Report, ReportItem, ReportSource, CATEGORIES
+from .analysis_agent import Report, ReportItem, CATEGORIES
 from .config import ShortcutConfig
-
-
-@dataclass
-class HyperlinkMarker:
-    text: str
-    url: str
 
 
 class DeliveryAgent:
@@ -45,151 +39,188 @@ class DeliveryAgent:
                 handle.write(creds.to_json())
         return creds
 
+    # ------------------------------------------------------------------
+    # Main document creation with REAL Google Docs table
+    # ------------------------------------------------------------------
+
     def create_report_doc(self, report: Report, title_prefix: str) -> str:
         creds = self._get_credentials()
         service = build("docs", "v1", credentials=creds)
 
         title = f"{title_prefix} {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
         doc = service.documents().create(body={"title": title}).execute()
-        doc_id = doc.get("documentId")
+        doc_id = doc["documentId"]
 
-        # Build clean table-style report
-        content, hyperlinks = self._build_table_style_report(report)
-        
-        requests = [
-            {"insertText": {"location": {"index": 1}, "text": content}}
-        ]
-        
-        # Add hyperlinks in reverse order
-        for start_idx, end_idx, url in reversed(hyperlinks):
-            requests.append({
-                "updateTextStyle": {
-                    "range": {
-                        "startIndex": start_idx + 1,
-                        "endIndex": end_idx + 1
-                    },
-                    "textStyle": {"link": {"url": url}},
-                    "fields": "link"
-                }
-            })
-        
+        items = report.items
+        num_rows = len(items) + 1  # +1 for header row
+        num_cols = 4
+
+        # --- Step 1: Insert a header line, then the table ---
+        header_text = (
+            f"REPORTE DE NEWSLETTERS\n"
+            f"{report.generated_at.strftime('%Y-%m-%d %H:%M')}\n"
+        )
+        if report.executive_summary_es:
+            header_text += f"{report.executive_summary_es}\n"
+        header_text += "\n"
+
         service.documents().batchUpdate(
-            documentId=doc_id, body={"requests": requests}
+            documentId=doc_id,
+            body={"requests": [
+                {"insertText": {"location": {"index": 1}, "text": header_text}},
+            ]},
         ).execute()
 
+        # Read doc to find end position, then insert table there
+        doc_struct = service.documents().get(documentId=doc_id).execute()
+        body_content = doc_struct["body"]["content"]
+        table_insert_idx = body_content[-1]["endIndex"] - 1
+
+        service.documents().batchUpdate(
+            documentId=doc_id,
+            body={"requests": [
+                {"insertTable": {
+                    "rows": num_rows,
+                    "columns": num_cols,
+                    "location": {"index": table_insert_idx},
+                }},
+            ]},
+        ).execute()
+
+        # --- Step 2: Read back document to get cell indices ---
+        doc_struct = service.documents().get(documentId=doc_id).execute()
+        cell_indices = self._extract_cell_indices(doc_struct)
+
+        # --- Step 3: Build cell data ---
+        header_row = ["TITULAR", "CUERPO", "FUENTE", "ENLACES"]
+        data_rows = []
+        for item in items:
+            enlaces_text = self._format_enlaces(item)
+            data_rows.append([
+                item.titular,
+                item.cuerpo,
+                item.fuente,
+                enlaces_text,
+            ])
+
+        all_rows = [header_row] + data_rows
+
+        # --- Step 4: Insert text into cells in REVERSE order ---
+        # This is critical: inserting text shifts all subsequent indices,
+        # so we must go from the last cell to the first.
+        insert_requests = []
+        for row_idx in range(len(all_rows) - 1, -1, -1):
+            for col_idx in range(num_cols - 1, -1, -1):
+                key = (row_idx, col_idx)
+                if key not in cell_indices:
+                    continue
+                text = all_rows[row_idx][col_idx] if col_idx < len(all_rows[row_idx]) else ""
+                if text:
+                    insert_requests.append({
+                        "insertText": {
+                            "location": {"index": cell_indices[key]},
+                            "text": text,
+                        }
+                    })
+
+        if insert_requests:
+            # Google Docs API limit per batch is ~500 requests; chunk if needed
+            for chunk_start in range(0, len(insert_requests), 400):
+                chunk = insert_requests[chunk_start:chunk_start + 400]
+                service.documents().batchUpdate(
+                    documentId=doc_id,
+                    body={"requests": chunk},
+                ).execute()
+
+        # --- Step 5: Style the header row (bold) ---
+        # Re-read to get updated indices after text insertion
+        doc_struct = service.documents().get(documentId=doc_id).execute()
+        style_requests = self._build_header_style_requests(doc_struct)
+        if style_requests:
+            service.documents().batchUpdate(
+                documentId=doc_id,
+                body={"requests": style_requests},
+            ).execute()
+
         return doc_id
-    
-    def _build_table_style_report(self, report: Report):
-        """Build report with table-like structure using text"""
-        lines = []
-        hyperlinks = []
-        
-        # Header
-        lines.append("📰 REPORTE DE NEWSLETTERS")
-        lines.append(f"{report.generated_at.strftime('%Y-%m-%d %H:%M')}\n")
-        
-        if report.executive_summary_es:
-            lines.append(f"📊 RESUMEN: {report.executive_summary_es}\n")
-        
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-        
-        # Group by category
-        category_order = ["new_models", "research", "robots", "funding", "apps", "general"]
-        
-        for cat_id in category_order:
-            cat_items = [i for i in report.items if i.category == cat_id]
-            if not cat_items:
+
+    # ------------------------------------------------------------------
+    # Table helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_cell_indices(doc: dict) -> dict:
+        """Get {(row, col): start_index} for the first paragraph in each cell."""
+        indices = {}
+        for element in doc["body"]["content"]:
+            if "table" not in element:
                 continue
-            
-            cat_items.sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.priority, 2))
-            
-            lines.append(f"\n{CATEGORIES[cat_id]['name_es']}")
-            lines.append("─" * 80)
-            lines.append("")
-            
-            for item_idx, item in enumerate(cat_items, 1):
-                current_pos = len("\n".join(lines)) + 1
-                
-                # Priority indicator
-                priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.priority, "")
-                indicators = []
-                if item.has_prompt:
-                    indicators.append("💡")
-                if item.has_video:
-                    indicators.append("🎬")
-                indicator_str = " ".join(indicators) + " " if indicators else ""
-                
-                # TEMA
-                lines.append(f"{item_idx}. {priority_icon} {indicator_str}{item.topic.upper()}")
-                lines.append("")
-                
-                # RESUMEN
-                resumen_clean = item.summary[:300] + "..." if len(item.summary) > 300 else item.summary
-                lines.append(f"   📝 RESUMEN:")
-                lines.append(f"   {resumen_clean}")
-                lines.append("")
-                
-                # NEWSLETTERS (fuentes)
-                fuentes = []
-                for s in item.sources:
-                    sender_clean = s.sender.split("<")[0].strip().replace(" via ", "")
-                    if len(sender_clean) > 30:
-                        sender_clean = sender_clean[:27] + "..."
-                    date_str = s.received_at.strftime("%m-%d")
-                    fuentes.append(f"{sender_clean} ({date_str})")
-                
-                lines.append(f"   📧 NEWSLETTERS:")
-                lines.append(f"   {' | '.join(fuentes[:3])}")
-                lines.append("")
-                
-                # PROMPT (si existe)
-                for source in item.sources:
-                    if source.prompt_of_day:
-                        prompt_clean = source.prompt_of_day[:180] + "..." if len(source.prompt_of_day) > 180 else source.prompt_of_day
-                        lines.append(f"   💡 PROMPT DEL DÍA:")
-                        lines.append(f"   \"{prompt_clean}\"")
-                        lines.append("")
+            for row_idx, row in enumerate(element["table"].get("tableRows", [])):
+                for col_idx, cell in enumerate(row.get("tableCells", [])):
+                    for para in cell.get("content", []):
+                        if "paragraph" in para:
+                            elems = para["paragraph"].get("elements", [])
+                            if elems:
+                                idx = elems[0].get("startIndex")
+                                if idx is not None:
+                                    indices[(row_idx, col_idx)] = idx
+                            break  # only first paragraph per cell
+        return indices
+
+    @staticmethod
+    def _build_header_style_requests(doc: dict) -> list:
+        """Bold the first row of the table."""
+        requests = []
+        for element in doc["body"]["content"]:
+            if "table" not in element:
+                continue
+            first_row = element["table"].get("tableRows", [])[0]
+            for cell in first_row.get("tableCells", []):
+                for para in cell.get("content", []):
+                    if "paragraph" in para:
+                        elems = para["paragraph"].get("elements", [])
+                        if elems:
+                            start = elems[0].get("startIndex", 0)
+                            end = elems[-1].get("endIndex", start)
+                            if end > start:
+                                requests.append({
+                                    "updateTextStyle": {
+                                        "range": {"startIndex": start, "endIndex": end},
+                                        "textStyle": {"bold": True},
+                                        "fields": "bold",
+                                    }
+                                })
                         break
-                
-                # ENLACES
-                current_pos = len("\n".join(lines)) + 1
-                lines.append("   🔗 ENLACES:")
-                current_pos += 14  # "   🔗 ENLACES:\n"
-                
-                link_parts = ["   "]
-                link_start = current_pos + 3
-                
-                all_links = []
-                for source in item.sources:
-                    # Video links
-                    for vlink in source.video_links[:1]:
-                        platform = "YouTube" if "youtu" in vlink.lower() else "Video"
-                        all_links.append((f"🎬 {platform}", vlink))
-                    # Email link
-                    all_links.append(("📧 Ver email", source.email_link))
-                    # Other links
-                    for link in source.extracted_links[:1]:
-                        if link not in source.video_links:
-                            label = self._get_link_label(link)
-                            all_links.append((f"🔗 {label}", link))
-                
-                for link_idx, (link_text, url) in enumerate(all_links[:5]):
-                    if link_idx > 0:
-                        link_parts.append(" | ")
-                        link_start += 3
-                    
-                    start = link_start
-                    link_parts.append(link_text)
-                    end = start + len(link_text)
-                    hyperlinks.append((start, end, url))
-                    link_start = end
-                
-                lines.append("".join(link_parts))
-                lines.append("")
-                lines.append("─" * 80)
-                lines.append("")
-        
-        return "\n".join(lines), hyperlinks
+        return requests
+
+    @staticmethod
+    def _format_enlaces(item: ReportItem) -> str:
+        """Format links for the ENLACES cell."""
+        parts = []
+        for link in item.enlaces[:3]:
+            if "youtu" in link.lower():
+                parts.append(f"Video: {link}")
+            else:
+                parts.append(link)
+        parts.append(f"Email: {item.email_link}")
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Preview for review agent (text only, no Google Docs)
+    # ------------------------------------------------------------------
+
+    def _render_report(self, report: Report) -> str:
+        lines = [f"RESUMEN: {report.executive_summary_es}\n"]
+        for item in report.items:
+            lines.append(f"- {item.titular}")
+            lines.append(f"  {item.cuerpo}")
+            lines.append(f"  Fuente: {item.fuente}")
+            lines.append("")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Shortcut creation
+    # ------------------------------------------------------------------
 
     def create_doc_shortcut(self, doc_id: str, shortcut: ShortcutConfig) -> Path:
         if not shortcut.enabled:
@@ -203,7 +234,6 @@ class DeliveryAgent:
             stamp = dt.datetime.now().strftime("%Y-%m-%d %H-%M")
             name = f"{name} - {stamp}"
         file_path = directory / f"{name}.webloc"
-
         file_path.write_text(self._webloc_content(doc_url), encoding="utf-8")
         return file_path
 
@@ -216,436 +246,13 @@ class DeliveryAgent:
     @staticmethod
     def _webloc_content(url: str) -> str:
         return (
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-            "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-            "<plist version=\"1.0\">\n"
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n'
             "<dict>\n"
             "  <key>URL</key>\n"
             f"  <string>{url}</string>\n"
             "</dict>\n"
             "</plist>\n"
         )
-
-    def _build_table_report_requests(self, report: Report):
-        """Build requests for real table-based report in Google Docs"""
-        requests = []
-        index = 1
-        
-        # Header
-        header_text = (
-            f"📰 REPORTE DE NEWSLETTERS\n"
-            f"{report.generated_at.strftime('%Y-%m-%d %H:%M')}\n\n"
-        )
-        
-        if report.executive_summary_es:
-            header_text += f"📊 RESUMEN: {report.executive_summary_es}\n\n"
-        
-        header_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        
-        requests.append({
-            "insertText": {
-                "location": {"index": index},
-                "text": header_text
-            }
-        })
-        index += len(header_text)
-        
-        # Group items by category
-        category_order = ["new_models", "research", "robots", "funding", "apps", "general"]
-        
-        for cat_id in category_order:
-            cat_items = [i for i in report.items if i.category == cat_id]
-            if not cat_items:
-                continue
-            
-            # Sort by priority within category
-            cat_items.sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.priority, 2))
-            
-            cat_name = CATEGORIES[cat_id]["name_es"]
-            
-            # Insert category header
-            cat_header = f"{cat_name}\n\n"
-            requests.append({
-                "insertText": {
-                    "location": {"index": index},
-                    "text": cat_header
-                }
-            })
-            index += len(cat_header)
-            
-            # Create table: Tema | Resumen | Fuentes | Enlaces
-            num_rows = len(cat_items) + 1  # +1 for header row
-            requests.append({
-                "insertTable": {
-                    "rows": num_rows,
-                    "columns": 4,
-                    "location": {"index": index}
-                }
-            })
-            
-            # Table structure in Google Docs:
-            # Each cell ends with \x0b (vertical tab)
-            # Each row ends with table row marker
-            # We need to track position carefully
-            
-            # Header row starts at index + 3
-            table_start = index
-            cell_index = table_start + 3
-            
-            # Fill header row
-            headers = [
-                ("Tema", True),
-                ("Resumen", True),
-                ("Newsletters", True),
-                ("Enlaces", True)
-            ]
-            
-            for col_idx, (header, bold) in enumerate(headers):
-                requests.append({
-                    "insertText": {
-                        "location": {"index": cell_index},
-                        "text": header
-                    }
-                })
-                if bold:
-                    requests.append({
-                        "updateTextStyle": {
-                            "range": {
-                                "startIndex": cell_index,
-                                "endIndex": cell_index + len(header)
-                            },
-                            "textStyle": {"bold": True},
-                            "fields": "bold"
-                        }
-                    })
-                cell_index += len(header) + 2  # +2 for cell end marker and next cell
-            
-            # Data rows
-            for row_idx, item in enumerate(cat_items):
-                # Column 0: Tema
-                priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.priority, "")
-                indicators = []
-                if item.has_prompt:
-                    indicators.append("💡")
-                if item.has_video:
-                    indicators.append("🎬")
-                indicator_str = " ".join(indicators) + " " if indicators else ""
-                tema_text = f"{priority_icon} {indicator_str}{item.topic.capitalize()}"
-                
-                requests.append({
-                    "insertText": {
-                        "location": {"index": cell_index},
-                        "text": tema_text
-                    }
-                })
-                cell_index += len(tema_text) + 2
-                
-                # Column 1: Resumen
-                resumen_text = item.summary[:300] + "..." if len(item.summary) > 300 else item.summary
-                requests.append({
-                    "insertText": {
-                        "location": {"index": cell_index},
-                        "text": resumen_text
-                    }
-                })
-                cell_index += len(resumen_text) + 2
-                
-                # Column 2: Newsletters (fuentes)
-                fuentes = []
-                for s in item.sources:
-                    sender_clean = s.sender.split("<")[0].strip()
-                    # Clean common newsletter suffixes
-                    sender_clean = sender_clean.replace(" via ", "")
-                    if len(sender_clean) > 25:
-                        sender_clean = sender_clean[:22] + "..."
-                    fuentes.append(sender_clean)
-                fuentes_text = "\n".join(fuentes[:3])
-                requests.append({
-                    "insertText": {
-                        "location": {"index": cell_index},
-                        "text": fuentes_text
-                    }
-                })
-                cell_index += len(fuentes_text) + 2
-                
-                # Column 3: Enlaces con hyperlinks
-                link_start = cell_index
-                all_links = []
-                
-                # Collect links from all sources
-                for source in item.sources:
-                    # Video links (high priority)
-                    for vlink in source.video_links[:1]:
-                        platform = "YouTube" if "youtu" in vlink.lower() else "Vimeo" if "vimeo" in vlink.lower() else "Video"
-                        all_links.append((f"🎬 {platform}", vlink))
-                    
-                    # Email link
-                    all_links.append(("📧 Email", source.email_link))
-                    
-                    # Other interesting links
-                    for link in source.extracted_links[:1]:
-                        if link not in source.video_links:
-                            link_label = self._get_link_label(link)
-                            all_links.append((link_label, link))
-                
-                # Insert links (max 5, newline separated)
-                for link_idx, (link_text, url) in enumerate(all_links[:5]):
-                    if link_idx > 0:
-                        requests.append({
-                            "insertText": {
-                                "location": {"index": cell_index},
-                                "text": "\n"
-                            }
-                        })
-                        cell_index += 1
-                    
-                    link_text_start = cell_index
-                    requests.append({
-                        "insertText": {
-                            "location": {"index": cell_index},
-                            "text": link_text
-                        }
-                    })
-                    
-                    # Add hyperlink
-                    requests.append({
-                        "updateTextStyle": {
-                            "range": {
-                                "startIndex": link_text_start,
-                                "endIndex": link_text_start + len(link_text)
-                            },
-                            "textStyle": {"link": {"url": url}},
-                            "fields": "link"
-                        }
-                    })
-                    
-                    cell_index += len(link_text)
-                
-                cell_index += 2  # End of row
-            
-            # Move index past the table
-            # Table size = initial marker + (rows * cols * 2) + row markers
-            table_content_size = 2 + (num_rows * 4 * 2) + num_rows
-            index = table_start + table_content_size
-            
-            # Add spacing after table
-            requests.append({
-                "insertText": {
-                    "location": {"index": index},
-                    "text": "\n\n"
-                }
-            })
-            index += 2
-        
-        return requests
-
-    def _render_report(self, report: Report) -> str:
-        """Generate text preview for review (not for final doc)"""
-        lines = []
-        lines.append(f"RESUMEN: {report.executive_summary_es}\n")
-        
-        category_order = ["new_models", "research", "robots", "funding", "apps", "general"]
-        
-        for cat_id in category_order:
-            cat_items = [i for i in report.items if i.category == cat_id]
-            if not cat_items:
-                continue
-            
-            cat_name = CATEGORIES[cat_id]["name_es"]
-            lines.append(f"\n{cat_name}\n")
-            
-            for item in cat_items:
-                priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.priority, "")
-                lines.append(f"{priority_icon} {item.topic}")
-                lines.append(f"Resumen: {item.summary[:200]}")
-                fuentes = [s.sender.split("<")[0].strip() for s in item.sources]
-                lines.append(f"Fuentes: {', '.join(fuentes[:3])}")
-                lines.append("")
-        
-        return "\n".join(lines)
-
-    def _render_report_with_links(self, report: Report) -> Tuple[str, List[Tuple[int, int, str]]]:
-        """Returns (content_text, list of (start_idx, end_idx, url))"""
-        lines = []
-        hyperlinks: List[Tuple[int, int, str]] = []
-        current_pos = 0
-        
-        def add_line(text: str):
-            nonlocal current_pos
-            lines.append(text)
-            current_pos += len(text) + 1  # +1 for newline
-        
-        def add_link(display_text: str, url: str):
-            nonlocal current_pos
-            start = current_pos
-            end = start + len(display_text)
-            hyperlinks.append((start, end, url))
-            return display_text
-        
-        add_line("📰 REPORTE DE NEWSLETTERS")
-        add_line(f"   {report.generated_at.strftime('%Y-%m-%d %H:%M')}")
-        add_line("")
-        add_line("LEYENDA: 🔴 Alta prioridad | 🟡 Media | 💡 Prompt del día | 🎬 Video")
-        add_line("")
-        
-        if report.executive_summary_es or report.executive_summary_en:
-            add_line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            add_line("📊 RESUMEN EJECUTIVO")
-            add_line(f"   {report.executive_summary_es}")
-            add_line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            add_line("")
-        
-        # Group by category instead of priority
-        category_order = ["new_models", "research", "robots", "funding", "apps", "general"]
-        
-        idx = 1
-        for cat_id in category_order:
-            cat_items = [i for i in report.items if i.category == cat_id]
-            if not cat_items:
-                continue
-            
-            cat_name = CATEGORIES[cat_id]["name_es"]
-            add_line(cat_name)
-            add_line("─" * 40)
-            
-            # Sort by priority within category
-            cat_items.sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.priority, 2))
-            
-            for item in cat_items:
-                self._render_item_with_links(item, idx, lines, hyperlinks, current_pos)
-                current_pos = sum(len(l) + 1 for l in lines)
-                idx += 1
-            add_line("")
-        
-        return "\n".join(lines), hyperlinks
-
-    def _render_item_with_links(
-        self, item: ReportItem, index: int, 
-        lines: List[str], hyperlinks: List[Tuple[int, int, str]], 
-        base_pos: int
-    ):
-        def current_pos():
-            return sum(len(l) + 1 for l in lines)
-        
-        # Build priority indicator
-        priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.priority, "")
-        
-        # Build special content indicators
-        indicators = []
-        if item.has_prompt:
-            indicators.append("💡")
-        if item.has_video:
-            indicators.append("🎬")
-        
-        indicator_str = " ".join(indicators) + " " if indicators else ""
-        
-        lines.append("")
-        lines.append(f"{index}. {priority_icon} {indicator_str}{item.topic.upper()}")
-        lines.append(f"   {item.summary}")
-        lines.append("")
-        
-        # Render sources with their special content
-        for source in item.sources:
-            self._render_source_with_links(source, lines, hyperlinks)
-
-        lines.append("")
-
-    def _render_source_with_links(
-        self, source: ReportSource, 
-        lines: List[str], hyperlinks: List[Tuple[int, int, str]]
-    ):
-        def current_pos():
-            return sum(len(l) + 1 for l in lines)
-        
-        sender_short = source.sender.split("<")[0].strip() if "<" in source.sender else source.sender
-        # Truncate long sender names
-        if len(sender_short) > 25:
-            sender_short = sender_short[:22] + "..."
-        time_str = source.received_at.strftime("%m-%d %H:%M")
-        
-        lines.append(f"   ┌─ 📧 {sender_short} ({time_str})")
-        
-        # Show prompt of the day COMPLETE (most valuable)
-        if source.prompt_of_day:
-            prompt_clean = source.prompt_of_day[:200] + "..." if len(source.prompt_of_day) > 200 else source.prompt_of_day
-            lines.append(f"   │  💡 PROMPT: \"{prompt_clean}\"")
-        
-        # Show video links with hyperlinks (high value)
-        if source.video_links:
-            for vlink in source.video_links[:2]:
-                pos = current_pos()
-                platform = "YouTube" if "youtu" in vlink.lower() else "Vimeo" if "vimeo" in vlink.lower() else "Video"
-                link_text = f"Ver en {platform}"
-                prefix = f"   │  🎬 "
-                start_idx = pos + len(prefix)
-                end_idx = start_idx + len(link_text)
-                hyperlinks.append((start_idx, end_idx, vlink))
-                lines.append(f"{prefix}{link_text}")
-        
-        # Other useful links - max 2
-        other_links = [l for l in source.extracted_links if l not in source.video_links][:2]
-        if other_links:
-            pos = current_pos()
-            prefix = "   │  🔗 "
-            line_parts = [prefix]
-            link_start = pos + len(prefix)
-            
-            for i, link in enumerate(other_links):
-                if i > 0:
-                    line_parts.append(" | ")
-                    link_start += 3
-                
-                link_text = self._get_link_label(link)
-                hyperlinks.append((link_start, link_start + len(link_text), link))
-                line_parts.append(link_text)
-                link_start += len(link_text)
-            
-            lines.append("".join(line_parts))
-        
-        # Email link as hyperlink
-        pos = current_pos()
-        prefix = "   └─ "
-        link_text = "Ver email"
-        start_idx = pos + len(prefix)
-        end_idx = start_idx + len(link_text)
-        hyperlinks.append((start_idx, end_idx, source.email_link))
-        lines.append(f"{prefix}{link_text}")
-
-    def _get_link_label(self, url: str) -> str:
-        """Extract a meaningful label from a URL"""
-        import re
-        from urllib.parse import urlparse
-        try:
-            parsed = urlparse(url)
-            domain = parsed.netloc.lower()
-            # Remove www prefix
-            domain = re.sub(r'^www\.', '', domain)
-            # Known domains with better names
-            name_map = {
-                'github.com': 'GitHub',
-                'twitter.com': 'Twitter',
-                'x.com': 'X/Twitter',
-                'linkedin.com': 'LinkedIn',
-                'medium.com': 'Medium',
-                'substack.com': 'Substack',
-                'reddit.com': 'Reddit',
-                'techcrunch.com': 'TechCrunch',
-                'theverge.com': 'The Verge',
-                'arxiv.org': 'Paper',
-                'huggingface.co': 'HuggingFace',
-                'openai.com': 'OpenAI',
-                'anthropic.com': 'Anthropic',
-                'wired.com': 'Wired',
-                'nytimes.com': 'NYTimes',
-                'bloomberg.com': 'Bloomberg',
-                'reuters.com': 'Reuters',
-            }
-            for key, name in name_map.items():
-                if key in domain:
-                    return name
-            # Return first part of domain capitalized
-            base = domain.split('.')[0]
-            return base.capitalize() if len(base) > 2 else "Enlace"
-        except Exception:
-            return "Enlace"

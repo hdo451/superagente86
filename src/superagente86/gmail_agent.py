@@ -187,6 +187,23 @@ class GmailAgent:
         decoded = base64.urlsafe_b64decode(data.encode("utf-8"))
         return decoded.decode("utf-8", errors="ignore")
 
+    def mark_as_read(self, message_ids: List[str]) -> None:
+        """Mark messages as read in Gmail."""
+        if not message_ids:
+            return
+        
+        creds = self._get_credentials()
+        service = build("gmail", "v1", credentials=creds)
+        
+        # Use batch modify to mark all as read
+        service.users().messages().batchModify(
+            userId="me",
+            body={
+                "ids": message_ids,
+                "removeLabelIds": ["UNREAD"]
+            }
+        ).execute()
+
     @staticmethod
     def _strip_html(text: str) -> str:
         stripped = []

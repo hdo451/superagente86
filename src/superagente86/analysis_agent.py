@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+import google.generativeai as genai
 
 from .gmail_agent import GmailMessage
 
@@ -14,66 +19,27 @@ class ReportSource:
     received_at: dt.datetime
     email_link: str
     extracted_links: List[str]
-    summary: str
-    prompt_of_day: Optional[str] = None
     video_links: List[str] = field(default_factory=list)
-    app_mentions: List[str] = field(default_factory=list)
-    company_news: List[str] = field(default_factory=list)
 
 
 @dataclass
 class ReportItem:
-    topic: str
-    tags: List[str]
-    priority: str
-    summary: str
-    sources: List[ReportSource]
-    category: str = "general"  # new_models, research, robots, funding, apps, general
-    has_prompt: bool = False
-    has_video: bool = False
-    has_company_news: bool = False
+    """A single news item extracted from a newsletter."""
+    titular: str
+    cuerpo: str
+    fuente: str  # Newsletter name (e.g. "The Neuron", "TLDR AI")
+    enlaces: List[str]
+    email_link: str
+    source_priority: int = 99  # Lower = higher priority
 
 
-# Category definitions for AI news
 CATEGORIES = {
-    "new_models": {
-        "name_es": "🚀 NUEVOS MODELOS",
-        "name_en": "New Models",
-        "keywords": ["gpt-5", "gpt-4", "claude", "gemini", "llama", "mistral", "model release", 
-                     "new model", "launches", "released", "announced", "upgrade", "version",
-                     "multimodal", "foundation model", "weights", "open source", "fine-tun"],
-    },
-    "research": {
-        "name_es": "🔬 RESEARCH",
-        "name_en": "Research",
-        "keywords": ["paper", "arxiv", "research", "study", "breakthrough", "discovered",
-                     "technique", "algorithm", "benchmark", "state-of-the-art", "sota",
-                     "training", "inference", "reasoning", "evaluation", "dataset"],
-    },
-    "robots": {
-        "name_es": "🤖 ROBOTS",
-        "name_en": "Robots",
-        "keywords": ["robot", "humanoid", "boston dynamics", "figure", "optimus", "tesla bot",
-                     "autonomous", "embodied", "manipulation", "locomotion", "actuator",
-                     "warehouse", "industrial robot", "cobot"],
-    },
-    "funding": {
-        "name_es": "💰 FUNDING & EMPRESAS",
-        "name_en": "Funding & Companies",
-        "keywords": ["raised", "funding", "series", "valuation", "acquisition", "acquired",
-                     "ipo", "merger", "billion", "million", "investor", "venture", "startup"],
-    },
-    "apps": {
-        "name_es": "🛠️ APPS & TOOLS",
-        "name_en": "Apps & Tools",
-        "keywords": ["app", "tool", "plugin", "extension", "api", "sdk", "platform",
-                     "saas", "product", "feature", "integration", "workflow", "automation"],
-    },
-    "general": {
-        "name_es": "📰 GENERAL",
-        "name_en": "General",
-        "keywords": [],
-    },
+    "new_models": {"name_es": "🚀 NUEVOS MODELOS", "name_en": "New Models"},
+    "research": {"name_es": "🔬 RESEARCH", "name_en": "Research"},
+    "robots": {"name_es": "🤖 ROBOTS", "name_en": "Robots"},
+    "funding": {"name_es": "💰 FUNDING & EMPRESAS", "name_en": "Funding & Companies"},
+    "apps": {"name_es": "🛠️ APPS & TOOLS", "name_en": "Apps & Tools"},
+    "general": {"name_es": "📰 GENERAL", "name_en": "General"},
 }
 
 
@@ -81,397 +47,255 @@ CATEGORIES = {
 class Report:
     generated_at: dt.datetime
     executive_summary_es: str
-    executive_summary_en: str
     items: List[ReportItem]
 
 
+# Newsletter source priority (lower = processed first, items kept over duplicates)
+SOURCE_PRIORITY = {
+    "the neuron": 0,
+    "tldr ai": 1,
+    "the rundown ai": 2,
+    "superhuman": 3,
+    "tldr": 4,
+}
+
+
 class AnalysisAgent:
+    def __init__(self) -> None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            genai.configure(api_key=api_key)
+            self._model = genai.GenerativeModel("gemini-2.5-flash")
+        else:
+            self._model = None
+
     def analyze(self, messages: List[GmailMessage], include_exec_summary: bool) -> Report:
-        grouped = self._group_by_topic(messages)
-        items = [self._build_item(topic, msgs) for topic, msgs in grouped.items()]
-        
-        # Deduplicate similar news across categories
-        items = self._deduplicate_items(items)
-        
-        exec_es, exec_en = (
-            self._build_exec_summary(items) if include_exec_summary else ("", "")
-        )
+        all_items: List[ReportItem] = []
+
+        for msg in messages:
+            items = self._extract_news_items(msg)
+            all_items.extend(items)
+
+        # Sort by source priority (The Neuron first, then TLDR AI, etc.)
+        all_items.sort(key=lambda x: x.source_priority)
+
+        # Deduplicate: keep first occurrence (highest priority source)
+        all_items = self._deduplicate(all_items)
+
+        exec_es = ""
+        if include_exec_summary and all_items:
+            sources = set(it.fuente for it in all_items)
+            exec_es = f"{len(all_items)} noticias de {len(sources)} newsletters."
+
         return Report(
             generated_at=dt.datetime.now(dt.timezone.utc),
             executive_summary_es=exec_es,
-            executive_summary_en=exec_en,
-            items=items,
+            items=all_items,
         )
 
-    def _deduplicate_items(self, items: List[ReportItem]) -> List[ReportItem]:
-        """Remove duplicate news that appear in multiple categories"""
-        seen_topics = {}
-        unique_items = []
-        
-        # Sort by priority to keep the highest priority version
-        priority_order = {"high": 0, "medium": 1, "low": 2}
-        sorted_items = sorted(items, key=lambda x: priority_order.get(x.priority, 2))
-        
-        for item in sorted_items:
-            # Create a normalized key from significant topic words
-            topic_words = item.topic.lower().split()
-            # Remove common words
-            stopwords = {"the", "a", "an", "and", "or", "of", "to", "in", "for", "is", "are", 
-                         "ai", "news", "update", "daily", "weekly", "newsletter", "today",
-                         "this", "that", "with", "from", "your", "on", "at", "by"}
-            key_words = set(w for w in topic_words if w not in stopwords and len(w) > 2)
-            
-            if not key_words:
-                unique_items.append(item)
-                continue
-            
-            # Check if similar topic already exists
-            is_duplicate = False
-            for seen_key, seen_item in seen_topics.items():
-                common = key_words & seen_key
-                # If more than 40% of significant words match, it's likely the same news
-                match_ratio = len(common) / max(len(key_words), 1)
-                if match_ratio >= 0.4 and len(common) >= 2:
-                    # Merge sources into the existing item
-                    seen_item.sources.extend(item.sources)
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                seen_topics[frozenset(key_words)] = item
-                unique_items.append(item)
-        
-        return unique_items
+    # ------------------------------------------------------------------
+    # Gemini API with rate-limit retry
+    # ------------------------------------------------------------------
 
-    def _group_by_topic(self, messages: List[GmailMessage]) -> Dict[str, List[GmailMessage]]:
-        grouped: Dict[str, List[GmailMessage]] = {}
-        for message in messages:
-            topic = self._normalize_topic(message.subject)
-            grouped.setdefault(topic, []).append(message)
-        for topic in grouped:
-            grouped[topic].sort(key=lambda m: m.received_at, reverse=True)
-        return grouped
+    def _gemini_call(self, prompt: str, max_retries: int = 2):
+        """Call Gemini with retry on rate limit errors."""
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._model.generate_content(prompt)
+                # Small delay between calls to avoid per-minute rate limits
+                time.sleep(2)
+                return response
+            except Exception as e:
+                err_str = str(e)
+                # Don't retry daily quota exhaustion — it won't recover
+                if "PerDay" in err_str or "limit: 0" in err_str:
+                    raise
+                if "429" in err_str and attempt < max_retries:
+                    wait = 15 * (attempt + 1)
+                    print(f"   ⏳ Rate limit, esperando {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise
 
-    def _normalize_topic(self, subject: str) -> str:
-        normalized = subject.strip().lower()
-        for prefix in ("re:", "fw:", "fwd:"):
-            if normalized.startswith(prefix):
-                normalized = normalized[len(prefix) :].strip()
-        return " ".join(normalized.split()) or "(no subject)"
+    # ------------------------------------------------------------------
+    # Gemini-based extraction
+    # ------------------------------------------------------------------
 
-    def _build_item(self, topic: str, messages: List[GmailMessage]) -> ReportItem:
-        tags = self._extract_tags(messages)
-        sources = [self._build_source(message) for message in messages]
-        
-        # Check for special content
-        has_prompt = any(s.prompt_of_day for s in sources)
-        has_video = any(s.video_links for s in sources)
-        has_company_news = any(s.company_news for s in sources)
-        
-        # Adjust priority based on content
-        if has_company_news:
-            tags.append("company")
-        if has_prompt:
-            tags.append("prompt")
-        if has_video:
-            tags.append("video")
-        
-        # Classify into category
-        combined_text = " ".join(m.subject + " " + (m.body_text or m.snippet) for m in messages)
-        category = self._classify_category(combined_text)
-        
-        priority = self._score_priority(tags, has_company_news, category)
-        primary = messages[0]
-        summary = self._summarize(primary, priority)
-        
-        return ReportItem(
-            topic=topic,
-            summary=summary,
-            tags=list(set(tags)),
-            priority=priority,
-            sources=sources,
-            category=category,
-            has_prompt=has_prompt,
-            has_video=has_video,
-            has_company_news=has_company_news,
-        )
-
-    def _classify_category(self, text: str) -> str:
-        """Classify text into one of the AI news categories"""
-        text_lower = text.lower()
-        scores = {}
-        
-        for cat_id, cat_info in CATEGORIES.items():
-            if cat_id == "general":
-                continue
-            score = sum(1 for kw in cat_info["keywords"] if kw in text_lower)
-            if score > 0:
-                scores[cat_id] = score
-        
-        if not scores:
-            return "general"
-        
-        # Return category with highest score
-        return max(scores, key=scores.get)
-
-    def _build_source(self, message: GmailMessage) -> ReportSource:
-        text = message.body_text or message.snippet
-        
-        # Extract prompt of the day
-        prompt = self._extract_prompt(text)
-        
-        # Detect video links
+    def _extract_news_items(self, message: GmailMessage) -> List[ReportItem]:
+        """Use Gemini to extract individual news from a newsletter email."""
+        fuente = self._extract_source_name(message.sender)
+        priority = self._get_source_priority(fuente)
+        email_link = message.link
         video_links = self._extract_video_links(message.links)
-        
-        # Detect app mentions vs company news
-        app_mentions = self._extract_app_mentions(text)
-        company_news = self._extract_company_news(text)
-        
-        summary = self._summarize_source(message)
-        
-        return ReportSource(
-            sender=message.sender,
-            received_at=message.received_at,
-            email_link=message.link,
-            extracted_links=[l for l in message.links if l not in video_links],
-            summary=summary,
-            prompt_of_day=prompt,
-            video_links=video_links,
-            app_mentions=app_mentions,
-            company_news=company_news,
+        other_links = [l for l in message.links if l not in video_links]
+
+        body = message.body_text or message.snippet or ""
+        body = self._strip_footer(body)
+
+        if not self._model or len(body.strip()) < 50:
+            return self._fallback_extract(message, fuente, priority)
+
+        prompt = (
+            "Eres un asistente que extrae noticias individuales de newsletters de tecnología/IA.\n"
+            "Analiza el siguiente email y extrae CADA noticia individual.\n"
+            "Para cada noticia devuelve:\n"
+            '- "titular": titular corto y claro en español (máx 12 palabras)\n'
+            '- "cuerpo": resumen en español de 2-3 oraciones. Debe explicar claramente qué pasó, '
+            "quién está involucrado y por qué importa. NO incluyas texto de pie de página, "
+            "enlaces, ni contenido promocional.\n\n"
+            "REGLAS:\n"
+            "- Máximo 5 noticias por newsletter. Prioriza las más importantes.\n"
+            "- Ignora publicidad, ofertas de trabajo, secciones de referidos, pie de página.\n"
+            "- Ignora secciones tipo 'Prompt of the day' o 'Meme of the day'.\n"
+            "- Solo extrae noticias reales con información sustancial.\n"
+            "- Si no hay noticias claras, devuelve un array vacío.\n"
+            "- Responde SOLO con un JSON array válido, sin markdown ni explicaciones.\n\n"
+            f"Newsletter: {fuente}\n"
+            f"Asunto: {message.subject}\n\n"
+            f"Contenido:\n{body[:6000]}\n\n"
+            'Responde SOLO con JSON: [{"titular": "...", "cuerpo": "..."}]'
         )
 
-    def _extract_tags(self, messages: List[GmailMessage]) -> List[str]:
-        text = " ".join(
-            f"{message.subject} {message.snippet}" for message in messages
-        ).lower()
-        tags = []
-        if "ai" in text or "ml" in text:
-            tags.append("ai")
-        if "product" in text:
-            tags.append("product")
-        if "funding" in text or "series" in text:
-            tags.append("funding")
-        if not tags:
-            tags.append("general")
-        return tags
+        try:
+            response = self._gemini_call(prompt)
+            raw = response.text.strip()
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                return self._fallback_extract(message, fuente, priority)
+        except Exception:
+            return self._fallback_extract(message, fuente, priority)
 
-    def _score_priority(self, tags: List[str], has_company_news: bool = False, category: str = "general") -> str:
-        # High priority: funding news, new models, company announcements
-        if "funding" in tags or has_company_news or category in ("funding", "new_models"):
-            return "high"
-        # Medium: research, robots, AI-related
-        if "ai" in tags or "company" in tags or category in ("research", "robots"):
-            return "medium"
-        return "low"
+        items: List[ReportItem] = []
+        for entry in parsed[:5]:  # Max 5 items per newsletter
+            titular = (entry.get("titular") or "").strip()
+            cuerpo = (entry.get("cuerpo") or "").strip()
+            if not titular or not cuerpo or len(cuerpo) < 20:
+                continue
 
-    def _summarize(self, message: GmailMessage, priority: str) -> str:
-        text = message.body_text.strip() if message.body_text else message.snippet
-        text = self._clean_text(text)
-        
-        # Split into sentences
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        
-        # Filter out non-informative sentences
-        skip_patterns = [
-            r"^(hi|hello|hey|welcome|good morning|to change|unsubscribe|manage your|update your)",
-            r"(hiring|job opening|we'?re hiring|join (?:us|our team))",
-            r"(advertise|sponsor|promotion|discount|sale)",
-            r"(\d+\s*min read|\d+\s*minute)",
-            r"(click here|read more|view|see more)",
-        ]
-        
-        news_keywords = {
-            "announced", "launched", "released", "raised", "acquired", "partnership",
-            "billion", "million", "percent", "growth", "revenue", "users",
-            "new", "first", "largest", "update", "version", "model", "feature",
-            "company", "startup", "ceo", "founder", "team", "breakthrough",
-            "research", "study", "paper", "ai", "robot", "funding",
+            # Assign relevant links from the email
+            enlaces = list(video_links[:2]) + list(other_links[:2])
+
+            items.append(ReportItem(
+                titular=titular,
+                cuerpo=cuerpo,
+                fuente=fuente,
+                enlaces=enlaces[:4],
+                email_link=email_link,
+                source_priority=priority,
+            ))
+
+        return items if items else self._fallback_extract(message, fuente, priority)
+
+    def _fallback_extract(self, message: GmailMessage, fuente: str, priority: int) -> List[ReportItem]:
+        """Regex-based fallback when Gemini is unavailable."""
+        subject = message.subject.strip()
+        # Clean subject: remove emojis and newsletter prefixes
+        subject = re.sub(r'^[^\w]*', '', subject).strip()
+        subject = subject[:80] if len(subject) > 80 else subject
+
+        body = message.body_text or message.snippet or ""
+        body = self._strip_footer(body)
+        # Clean body: remove URLs, artifacts, take first meaningful chunk
+        body = re.sub(r'https?://\S+', '', body)
+        body = re.sub(r'[\u200b\u200c\u200d\u2060\ufeff\u00ad]+', '', body)
+        body = re.sub(r'\s+', ' ', body).strip()
+        # Take first 300 chars that look like actual content
+        cuerpo = body[:300].strip()
+        if len(cuerpo) < 20:
+            cuerpo = f"Newsletter de {fuente}: {subject}"
+
+        video_links = self._extract_video_links(message.links)
+        other_links = [l for l in message.links if l not in video_links]
+
+        return [ReportItem(
+            titular=subject,
+            cuerpo=cuerpo,
+            fuente=fuente,
+            enlaces=(video_links[:2] + other_links[:2])[:4],
+            email_link=message.link,
+            source_priority=priority,
+        )]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _deduplicate(self, items: List[ReportItem]) -> List[ReportItem]:
+        """Remove duplicate news across newsletters. Items are pre-sorted by priority."""
+        unique: List[ReportItem] = []
+        seen_keys: List[set] = []
+
+        stopwords = {
+            "the", "a", "an", "and", "or", "of", "to", "in", "for", "is", "are",
+            "de", "la", "el", "en", "con", "por", "que", "un", "una", "los", "las",
+            "su", "del", "al", "se", "no", "es", "lo", "como", "más", "ya",
         }
-        
-        scored_sentences = []
-        
-        for s in sentences:
-            if len(s) < 25 or len(s) > 400:
+
+        for item in items:
+            words = set(
+                w for w in re.findall(r'\w+', item.titular.lower())
+                if w not in stopwords and len(w) > 2
+            )
+            if not words:
+                unique.append(item)
+                seen_keys.append(words)
                 continue
-            
-            s_lower = s.lower()
-            
-            # Skip non-informative patterns
-            if any(re.search(pattern, s_lower, re.IGNORECASE) for pattern in skip_patterns):
-                continue
-            
-            # Score based on news keywords
-            score = sum(1 for kw in news_keywords if kw in s_lower)
-            
-            # Bonus for having numbers (often indicates facts)
-            if re.search(r'\d+', s):
-                score += 1
-            
-            # Bonus for having company names
-            if re.search(r'\b(OpenAI|Google|Microsoft|Meta|Anthropic|xAI|Amazon|Apple|Tesla|Nvidia)\b', s, re.IGNORECASE):
-                score += 2
-            
-            if score >= 2:  # Minimum threshold
-                scored_sentences.append((score, s.strip()))
-        
-        # Sort and take best sentences
-        scored_sentences.sort(reverse=True, key=lambda x: x[0])
-        
-        if scored_sentences:
-            # Take top sentences but avoid duplicates
-            result_sentences = []
-            seen_words = set()
-            
-            for score, sent in scored_sentences[:4]:
-                sent_words = set(sent.lower().split())
-                # Check overlap with already selected
-                overlap = len(sent_words & seen_words) / max(len(sent_words), 1)
-                if overlap < 0.4:  # Less than 40% overlap
-                    result_sentences.append(sent)
-                    seen_words.update(sent_words)
-                    if len(result_sentences) >= 2:
-                        break
-            
-            result = " ".join(result_sentences)
-        else:
-            # Fallback: extract from subject or first sentence
-            subject_summary = message.subject.split("-")[-1].strip() if "-" in message.subject else message.subject
-            first_good_sentence = None
-            for s in sentences:
-                if len(s) > 30 and not any(re.search(p, s.lower()) for p in skip_patterns):
-                    first_good_sentence = s.strip()
+
+            is_dup = False
+            for seen in seen_keys:
+                if not seen:
+                    continue
+                common = words & seen
+                ratio = len(common) / min(len(words), len(seen)) if min(len(words), len(seen)) > 0 else 0
+                if ratio >= 0.5 and len(common) >= 2:
+                    is_dup = True
                     break
-            result = first_good_sentence or subject_summary
-        
-        # Ensure reasonable length
-        words = result.split()
-        max_words = 50 if priority == "high" else 35
-        if len(words) > max_words:
-            return " ".join(words[:max_words]) + "..."
-        return result if result else f"Newsletter sobre {message.subject[:50]}"
 
-    def _summarize_source(self, message: GmailMessage) -> str:
-        # Use snippet only to avoid duplication with main summary
-        text = message.snippet or ""
-        text = self._clean_text(text)
-        words = text.split()
-        if len(words) > 25:
-            return " ".join(words[:25]) + "..."
-        return text if text else "(sin extracto)"
+            if not is_dup:
+                unique.append(item)
+                seen_keys.append(words)
 
-    def _clean_text(self, text: str) -> str:
-        # Remove zero-width characters and artifacts
-        text = re.sub(r'[\u200b\u200c\u200d\u2060\ufeff]+', '', text)
-        # Remove ALL image placeholders and patterns
-        text = re.sub(r'View image:.*?(?:Caption:|$)', '', text, flags=re.IGNORECASE|re.DOTALL)
-        text = re.sub(r'Follow image link:.*?(?:\s|$)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\[image\]|\[img\]|\(image\)|Image:', '', text, flags=re.IGNORECASE)
-        # Remove newsletter intro/outro patterns
-        intro_patterns = [
-            r'Welcome back[^.]*\.?',
-            r'Welcome,? \w+[^.]*\.?',
-            r'Happy \w+day[^.]*\.?',
-            r'Good (?:morning|afternoon|evening)[^.]*\.?',
-            r'Hi there[^.]*\.?',
-            r'Hello[^.]*\.?',
-            r'Hey[^.]*\.?',
-            r"Here'?s? (?:what|today)[^.]*\.?",
-            r'In this (?:issue|edition|newsletter)[^.]*\.?',
-            r'Today we[^.]*\.?',
-            r'This week[^.]*\.?',
-        ]
-        for pattern in intro_patterns:
-            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
-        # Remove promotional/CTA text
-        text = re.sub(r'(?:Sign Up|Subscribe|Unsubscribe|Click here|Read more|View in browser|Advertise|Forward this|Refer a friend|Share this|Sponsor)[^.]*\.?', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'(?:Share|Tweet|Post|Like|Follow us|Join us)[^.]{0,30}', '', text, flags=re.IGNORECASE)
-        # Remove URL patterns in text
-        text = re.sub(r'https?://\S*', '', text)
-        text = re.sub(r'www\.\S*', '', text)
-        # Remove email artifacts
-        text = re.sub(r'\(?\s*Caption:\s*\)?', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'Refer\s*\|\s*Tldr\s*\|\s*Advertise', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\|\s*Advertise', '', text, flags=re.IGNORECASE)
-        # Remove repeated special chars
-        text = re.sub(r'[\u2022\u2023\u25aa\u25ab\u25cf\u25cb]{2,}', '', text)
-        # Clean whitespace
-        text = re.sub(r'[\r\n\t]+', ' ', text)
-        text = re.sub(r'\s+', ' ', text)
-        # Remove orphan punctuation and empty parens
-        text = re.sub(r'\s[|:;,]+\s', ' ', text)
-        text = re.sub(r'\(\s*\)', '', text)
-        text = re.sub(r'\[\s*\]', '', text)
-        return text.strip()
+        return unique
 
-    def _extract_prompt(self, text: str) -> Optional[str]:
-        patterns = [
-            r"prompt\s*(?:of\s*the\s*)?day[:\s]*([^\n]{10,500})",
-            r"daily\s*prompt[:\s]*([^\n]{10,500})",
-            r"today'?s?\s*prompt[:\s]*([^\n]{10,500})",
-            r"prompt:\s*([^\n]{10,500})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-        return None
+    @staticmethod
+    def _extract_source_name(sender: str) -> str:
+        """Extract clean newsletter name from sender field."""
+        name = sender.split("<")[0].strip().strip('"').strip("'")
+        # Remove quotes and common suffixes
+        name = re.sub(r'\s*(?:via|by|from)\s+.*$', '', name, flags=re.IGNORECASE)
+        return name.strip() or sender
 
-    def _extract_video_links(self, links: List[str]) -> List[str]:
-        video_domains = ["youtube.com", "youtu.be", "vimeo.com", "loom.com", "wistia.com"]
+    @staticmethod
+    def _get_source_priority(fuente: str) -> int:
+        fuente_lower = fuente.lower()
+        for key, prio in SOURCE_PRIORITY.items():
+            if key in fuente_lower:
+                return prio
+        return 99
+
+    @staticmethod
+    def _extract_video_links(links: List[str]) -> List[str]:
+        video_domains = ["youtube.com", "youtu.be", "vimeo.com"]
         return [l for l in links if any(d in l.lower() for d in video_domains)]
 
-    def _extract_app_mentions(self, text: str) -> List[str]:
-        patterns = [
-            r"(?:try|check out|download|use|introducing)\s+([A-Z][a-zA-Z0-9]{2,}(?:\s+[A-Z][a-zA-Z0-9]+)?)",
-            r"(?:new app|new tool)[:\s]+([A-Z][a-zA-Z0-9]{2,}(?:\s+[A-Z0-9]+)?)",
+    @staticmethod
+    def _strip_footer(text: str) -> str:
+        """Remove common email footer/boilerplate text."""
+        # Cut at common footer markers
+        markers = [
+            r"(?:^|\n)[-_=]{10,}",
+            r"(?:^|\n)(?:Unsubscribe|CHANGE E-MAIL|Manage your subscription|Sent by|You'?re receiving)",
+            r"(?:^|\n)(?:Copyright|©|\(c\))\s+\d{4}",
+            r"(?:^|\n)Refer\s*\|\s*Tldr",
+            r"(?:^|\n)(?:No longer want|To stop receiving)",
+            r"(?:^|\n)(?:Legal and Privacy|Privacy Policy)",
         ]
-        apps = []
-        stopwords = {'the', 'and', 'for', 'with', 'this', 'that', 'your', 'our', 'his', 'her'}
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for m in matches:
-                cleaned = m.strip()
-                if len(cleaned) > 2 and cleaned.lower() not in stopwords:
-                    apps.append(cleaned)
-        return list(set(apps))[:3]
-
-    def _extract_company_news(self, text: str) -> List[str]:
-        # Look for full sentence fragments with company + action
-        patterns = [
-            r"((?:OpenAI|Google|Microsoft|Meta|Apple|Amazon|Anthropic|Nvidia|Tesla|xAI|Mistral|Cohere)\s+(?:announced|launches|raised|acquired|partners|releases)[^.]{5,80})",
-            r"(\$[\d.]+[MBK]?\s+(?:funding|raised|valuation)[^.]{5,50})",
-        ]
-        news = []
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for m in matches:
-                cleaned = self._clean_text(m)
-                if len(cleaned) > 15:
-                    news.append(cleaned[:100])
-        return list(set(news))[:3]
-
-    def _build_exec_summary(self, items: List[ReportItem]) -> tuple[str, str]:
-        if not items:
-            return "Sin novedades relevantes.", "No relevant updates."
-        
-        # Count by category
-        cat_counts = {}
-        for item in items:
-            cat_counts[item.category] = cat_counts.get(item.category, 0) + 1
-        
-        # Build summary showing category breakdown
-        parts_es = []
-        parts_en = []
-        for cat_id in ["new_models", "research", "robots", "funding", "apps", "general"]:
-            if cat_id in cat_counts:
-                count = cat_counts[cat_id]
-                name_es = CATEGORIES[cat_id]["name_es"].split(" ", 1)[1]  # Remove emoji
-                name_en = CATEGORIES[cat_id]["name_en"]
-                parts_es.append(f"{count} {name_es}")
-                parts_en.append(f"{count} {name_en}")
-        
-        es = f"Hoy: {', '.join(parts_es)}. Total: {len(items)} noticias."
-        en = f"Today: {', '.join(parts_en)}. Total: {len(items)} news."
-        
-        return es, en
+        for marker in markers:
+            match = re.search(marker, text, re.IGNORECASE)
+            if match and match.start() > len(text) * 0.3:
+                text = text[:match.start()]
+        return text.strip()
