@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 from typing import List
 
 from googleapiclient.discovery import build
@@ -9,6 +10,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 from .analysis_agent import Report, ReportItem, ReportSource
+from .config import ShortcutConfig
 
 
 class DeliveryAgent:
@@ -53,6 +55,42 @@ class DeliveryAgent:
         ).execute()
 
         return doc_id
+
+    def create_doc_shortcut(self, doc_id: str, shortcut: ShortcutConfig) -> Path:
+        if not shortcut.enabled:
+            raise ValueError("Shortcut creation is disabled")
+        doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+        directory = self._resolve_directory(shortcut.directory)
+        directory.mkdir(parents=True, exist_ok=True)
+
+        name = shortcut.name_prefix.strip() or "Newsletter Report"
+        if shortcut.include_timestamp:
+            stamp = dt.datetime.now().strftime("%Y-%m-%d %H-%M")
+            name = f"{name} - {stamp}"
+        file_path = directory / f"{name}.webloc"
+
+        file_path.write_text(self._webloc_content(doc_url), encoding="utf-8")
+        return file_path
+
+    @staticmethod
+    def _resolve_directory(value: str) -> Path:
+        if value.startswith("/") or value.startswith("~"):
+            return Path(value).expanduser()
+        return Path.home() / value
+
+    @staticmethod
+    def _webloc_content(url: str) -> str:
+        return (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+            "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            "<plist version=\"1.0\">\n"
+            "<dict>\n"
+            "  <key>URL</key>\n"
+            f"  <string>{url}</string>\n"
+            "</dict>\n"
+            "</plist>\n"
+        )
 
     def _render_report(self, report: Report) -> str:
         lines = []

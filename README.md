@@ -33,6 +33,7 @@ Pipeline en Python para leer newsletters desde Gmail (etiqueta `newsletters`), a
 - El reporte se crea como un Google Doc nuevo por ejecucion.
 - Las noticias repetidas se agrupan por tema exacto (subject normalizado).
 - Cada noticia incluye fuentes y links extraidos del correo.
+- En cada ejecucion se crea un acceso directo en el Escritorio al Google Doc.
 
 ## Siguiente paso (scheduler)
 

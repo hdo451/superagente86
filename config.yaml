@@ -8,3 +8,8 @@ schedule:
     - "08:30"
     - "13:30"
   timezone: US/Pacific
+shortcut:
+  enabled: true
+  name_prefix: "Reporte diario AI"
+  directory: Desktop
+  include_timestamp: true

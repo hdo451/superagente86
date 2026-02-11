@@ -55,8 +55,13 @@ class Pipeline:
         )
 
         doc_id = None
+        shortcut_path = None
         if not dry_run:
             doc_id = self._delivery.create_report_doc(report, title_prefix=title_prefix)
+            if self._app_config.shortcut.enabled and doc_id:
+                shortcut_path = self._delivery.create_doc_shortcut(
+                    doc_id, self._app_config.shortcut
+                )
 
         state["last_run"] = dt.datetime.now(dt.timezone.utc).isoformat()
         state["window_start"] = window_start.isoformat()
@@ -67,6 +72,7 @@ class Pipeline:
 
         return {
             "doc_id": doc_id,
+            "shortcut_path": str(shortcut_path) if shortcut_path else None,
             "items": len(messages),
             "state": state,
         }

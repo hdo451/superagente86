@@ -20,11 +20,20 @@ class ReportConfig:
 
 
 @dataclass
+class ShortcutConfig:
+    enabled: bool
+    name_prefix: str
+    directory: str
+    include_timestamp: bool
+
+
+@dataclass
 class AppConfig:
     label: str
     max_messages: int
     report: ReportConfig
     schedule: ScheduleConfig
+    shortcut: ShortcutConfig
 
 
 @dataclass
@@ -41,6 +50,7 @@ def load_app_config(path: str) -> AppConfig:
 
     report = raw.get("report", {})
     schedule = raw.get("schedule", {})
+    shortcut = raw.get("shortcut", {})
 
     return AppConfig(
         label=raw.get("label", "newsletters"),
@@ -52,6 +62,12 @@ def load_app_config(path: str) -> AppConfig:
         schedule=ScheduleConfig(
             times=schedule.get("times", ["08:30", "13:30"]),
             timezone=schedule.get("timezone", "local"),
+        ),
+        shortcut=ShortcutConfig(
+            enabled=bool(shortcut.get("enabled", False)),
+            name_prefix=shortcut.get("name_prefix", "Newsletter Report"),
+            directory=shortcut.get("directory", "Desktop"),
+            include_timestamp=bool(shortcut.get("include_timestamp", True)),
         ),
     )
 
