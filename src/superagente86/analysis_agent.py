@@ -269,26 +269,72 @@ class AnalysisAgent:
         text = message.body_text.strip() if message.body_text else message.snippet
         text = self._clean_text(text)
         
-        # Remove duplicated sentences
-        sentences = text.split('.')
-        seen = set()
-        unique_sentences = []
+        # Split into sentences and find the most informative ones
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        # Score sentences by informativeness
+        news_keywords = {
+            "announced", "launched", "released", "raised", "acquired", "partnership",
+            "billion", "million", "percent", "growth", "revenue", "users",
+            "new", "first", "largest", "update", "version", "model", "feature",
+            "company", "startup", "ceo", "founder", "team", "employees",
+        }
+        
+        scored_sentences = []
+        seen_content = set()
+        
         for s in sentences:
-            s_clean = s.strip().lower()
-            if s_clean and s_clean not in seen and len(s_clean) > 10:
-                seen.add(s_clean)
-                unique_sentences.append(s.strip())
+            s = s.strip()
+            if len(s) < 20 or len(s) > 300:
+                continue
+            
+            # Skip if too similar to already selected
+            s_lower = s.lower()
+            s_words = set(s_lower.split())
+            is_duplicate = False
+            for seen in seen_content:
+                common = s_words & seen
+                if len(common) > len(s_words) * 0.5:
+                    is_duplicate = True
+                    break
+            if is_duplicate:
+                continue
+            
+            # Score based on news keywords
+            score = sum(1 for kw in news_keywords if kw in s_lower)
+            # Bonus for having numbers (often indicates data/facts)
+            if re.search(r'\d+', s):
+                score += 1
+            # Penalty for promotional language
+            if any(w in s_lower for w in ["click", "subscribe", "join", "free", "discount"]):
+                score -= 2
+            
+            if score > 0:
+                scored_sentences.append((score, s))
+                seen_content.add(frozenset(s_words))
         
-        text = '. '.join(unique_sentences[:3])  # Max 3 sentences
-        if text and not text.endswith('.'):
-            text += '.'
+        # Sort by score and take best sentences
+        scored_sentences.sort(reverse=True, key=lambda x: x[0])
+        best_sentences = [s for _, s in scored_sentences[:2]]
         
-        # Limit to reasonable length
-        word_limit = 40 if priority == "high" else 25
-        words = text.split()
-        if len(words) > word_limit:
-            return " ".join(words[:word_limit]) + "..."
-        return text if text else "(sin resumen)"
+        if best_sentences:
+            result = " ".join(best_sentences)
+        else:
+            # Fallback: take first non-trivial sentence
+            for s in sentences:
+                s = s.strip()
+                if len(s) > 30 and not any(w in s.lower() for w in ["welcome", "hello", "hi ", "hey "]):
+                    result = s
+                    break
+            else:
+                result = text[:150] + "..." if len(text) > 150 else text
+        
+        # Ensure reasonable length
+        words = result.split()
+        max_words = 45 if priority == "high" else 30
+        if len(words) > max_words:
+            return " ".join(words[:max_words]) + "..."
+        return result if result else "(sin resumen)"
 
     def _summarize_source(self, message: GmailMessage) -> str:
         # Use snippet only to avoid duplication with main summary
