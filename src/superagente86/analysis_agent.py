@@ -269,72 +269,87 @@ class AnalysisAgent:
         text = message.body_text.strip() if message.body_text else message.snippet
         text = self._clean_text(text)
         
-        # Split into sentences and find the most informative ones
+        # Split into sentences
         sentences = re.split(r'(?<=[.!?])\s+', text)
         
-        # Score sentences by informativeness
+        # Filter out non-informative sentences
+        skip_patterns = [
+            r"^(hi|hello|hey|welcome|good morning|to change|unsubscribe|manage your|update your)",
+            r"(hiring|job opening|we'?re hiring|join (?:us|our team))",
+            r"(advertise|sponsor|promotion|discount|sale)",
+            r"(\d+\s*min read|\d+\s*minute)",
+            r"(click here|read more|view|see more)",
+        ]
+        
         news_keywords = {
             "announced", "launched", "released", "raised", "acquired", "partnership",
             "billion", "million", "percent", "growth", "revenue", "users",
             "new", "first", "largest", "update", "version", "model", "feature",
-            "company", "startup", "ceo", "founder", "team", "employees",
+            "company", "startup", "ceo", "founder", "team", "breakthrough",
+            "research", "study", "paper", "ai", "robot", "funding",
         }
         
         scored_sentences = []
-        seen_content = set()
         
         for s in sentences:
-            s = s.strip()
-            if len(s) < 20 or len(s) > 300:
+            if len(s) < 25 or len(s) > 400:
                 continue
             
-            # Skip if too similar to already selected
             s_lower = s.lower()
-            s_words = set(s_lower.split())
-            is_duplicate = False
-            for seen in seen_content:
-                common = s_words & seen
-                if len(common) > len(s_words) * 0.5:
-                    is_duplicate = True
-                    break
-            if is_duplicate:
+            
+            # Skip non-informative patterns
+            if any(re.search(pattern, s_lower, re.IGNORECASE) for pattern in skip_patterns):
                 continue
             
             # Score based on news keywords
             score = sum(1 for kw in news_keywords if kw in s_lower)
-            # Bonus for having numbers (often indicates data/facts)
+            
+            # Bonus for having numbers (often indicates facts)
             if re.search(r'\d+', s):
                 score += 1
-            # Penalty for promotional language
-            if any(w in s_lower for w in ["click", "subscribe", "join", "free", "discount"]):
-                score -= 2
             
-            if score > 0:
-                scored_sentences.append((score, s))
-                seen_content.add(frozenset(s_words))
+            # Bonus for having company names
+            if re.search(r'\b(OpenAI|Google|Microsoft|Meta|Anthropic|xAI|Amazon|Apple|Tesla|Nvidia)\b', s, re.IGNORECASE):
+                score += 2
+            
+            if score >= 2:  # Minimum threshold
+                scored_sentences.append((score, s.strip()))
         
-        # Sort by score and take best sentences
+        # Sort and take best sentences
         scored_sentences.sort(reverse=True, key=lambda x: x[0])
-        best_sentences = [s for _, s in scored_sentences[:2]]
         
-        if best_sentences:
-            result = " ".join(best_sentences)
+        if scored_sentences:
+            # Take top sentences but avoid duplicates
+            result_sentences = []
+            seen_words = set()
+            
+            for score, sent in scored_sentences[:4]:
+                sent_words = set(sent.lower().split())
+                # Check overlap with already selected
+                overlap = len(sent_words & seen_words) / max(len(sent_words), 1)
+                if overlap < 0.4:  # Less than 40% overlap
+                    result_sentences.append(sent)
+                    seen_words.update(sent_words)
+                    if len(result_sentences) >= 2:
+                        break
+            
+            result = " ".join(result_sentences)
         else:
-            # Fallback: take first non-trivial sentence
+            # Fallback: extract from subject or first sentence
+            subject_summary = message.subject.split("-")[-1].strip() if "-" in message.subject else message.subject
+            first_good_sentence = None
             for s in sentences:
-                s = s.strip()
-                if len(s) > 30 and not any(w in s.lower() for w in ["welcome", "hello", "hi ", "hey "]):
-                    result = s
+                if len(s) > 30 and not any(re.search(p, s.lower()) for p in skip_patterns):
+                    first_good_sentence = s.strip()
                     break
-            else:
-                result = text[:150] + "..." if len(text) > 150 else text
+            result = first_good_sentence or subject_summary
         
         # Ensure reasonable length
         words = result.split()
-        max_words = 45 if priority == "high" else 30
+        max_words = 50 if priority == "high" else 35
         if len(words) > max_words:
             return " ".join(words[:max_words]) + "..."
-        return result if result else "(sin resumen)"
+        return result if result else f"Newsletter sobre {message.subject[:50]}"
 
     def _summarize_source(self, message: GmailMessage) -> str:
         # Use snippet only to avoid duplication with main summary

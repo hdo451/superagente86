@@ -53,33 +53,13 @@ class DeliveryAgent:
         doc = service.documents().create(body={"title": title}).execute()
         doc_id = doc.get("documentId")
 
-        # Build content and collect hyperlink positions
-        content, hyperlinks = self._render_report_with_links(report)
+        # Build table-based report
+        requests = self._build_table_report_requests(report)
         
-        # Insert text first
-        requests = [
-            {"insertText": {"location": {"index": 1}, "text": content}}
-        ]
-        
-        # Add hyperlink formatting requests
-        # Links need to be applied in reverse order to preserve positions
-        for start_idx, end_idx, url in reversed(hyperlinks):
-            requests.append({
-                "updateTextStyle": {
-                    "range": {
-                        "startIndex": start_idx + 1,  # +1 because doc starts at index 1
-                        "endIndex": end_idx + 1,
-                    },
-                    "textStyle": {
-                        "link": {"url": url}
-                    },
-                    "fields": "link"
-                }
-            })
-        
-        service.documents().batchUpdate(
-            documentId=doc_id, body={"requests": requests}
-        ).execute()
+        if requests:
+            service.documents().batchUpdate(
+                documentId=doc_id, body={"requests": requests}
+            ).execute()
 
         return doc_id
 
@@ -119,9 +99,151 @@ class DeliveryAgent:
             "</plist>\n"
         )
 
+    def _build_table_report_requests(self, report: Report):
+        """Build requests for clean, table-like structured report"""
+        content_parts = []
+        hyperlinks = []  # (start_idx, end_idx, url)
+        
+        # Header
+        content_parts.append("📰 REPORTE DE NEWSLETTERS\n")
+        content_parts.append(f"{report.generated_at.strftime('%Y-%m-%d %H:%M')}\n\n")
+        
+        if report.executive_summary_es:
+            content_parts.append(f"📊 RESUMEN: {report.executive_summary_es}\n\n")
+        
+        content_parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+        
+        # Group items by category
+        category_order = ["new_models", "research", "robots", "funding", "apps", "general"]
+        
+        for cat_id in category_order:
+            cat_items = [i for i in report.items if i.category == cat_id]
+            if not cat_items:
+                continue
+            
+            # Sort by priority within category
+            cat_items.sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.priority, 2))
+            
+            cat_name = CATEGORIES[cat_id]["name_es"]
+            content_parts.append(f"{cat_name}\n")
+            content_parts.append("─" * 60 + "\n\n")
+            
+            for item_idx, item in enumerate(cat_items, 1):
+                current_pos = sum(len(p) for p in content_parts)
+                
+                # Priority icon
+                priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.priority, "")
+                indicators = []
+                if item.has_prompt:
+                    indicators.append("💡")
+                if item.has_video:
+                    indicators.append("🎬")
+                indicator_str = " ".join(indicators) + " " if indicators else ""
+                
+                # Item box
+                content_parts.append(f"{item_idx}. {priority_icon} {indicator_str}{item.topic.upper()}\n\n")
+                
+                # Resumen
+                resumen_clean = item.summary[:250] + "..." if len(item.summary) > 250 else item.summary
+                content_parts.append(f"   📝 {resumen_clean}\n\n")
+                
+                # Fuentes
+                fuentes = []
+                for s in item.sources:
+                    sender_clean = s.sender.split("<")[0].strip()
+                    if len(sender_clean) > 30:
+                        sender_clean = sender_clean[:27] + "..."
+                    fuentes.append(f"{sender_clean} ({s.received_at.strftime('%m-%d')})")
+                fuentes_text = " | ".join(fuentes[:3])
+                content_parts.append(f"   📧 Fuentes: {fuentes_text}\n\n")
+                
+                # Prompt of the day (if any)
+                for source in item.sources:
+                    if source.prompt_of_day:
+                        prompt_text = source.prompt_of_day[:150] + "..." if len(source.prompt_of_day) > 150 else source.prompt_of_day
+                        content_parts.append(f"   💡 Prompt: \"{prompt_text}\"\n\n")
+                        break
+                
+                # Enlaces con hyperlinks
+                current_pos = sum(len(p) for p in content_parts)
+                content_parts.append("   🔗 ")
+                current_pos += 5
+                
+                all_links = []
+                for source in item.sources:
+                    # Video links (priority)
+                    for vlink in source.video_links[:1]:
+                        platform = "YouTube" if "youtu" in vlink.lower() else "Vimeo" if "vimeo" in vlink.lower() else "Video"
+                        all_links.append((f"Ver {platform}", vlink))
+                    # Email link
+                    all_links.append(("Ver email", source.email_link))
+                    # Other interesting links
+                    for link in source.extracted_links[:1]:
+                        if link not in source.video_links:
+                            link_label = self._get_link_label(link)
+                            all_links.append((link_label, link))
+                
+                # Add links (max 4)
+                for link_idx, (link_text, url) in enumerate(all_links[:4]):
+                    if link_idx > 0:
+                        content_parts.append(" | ")
+                        current_pos += 3
+                    
+                    start = current_pos
+                    content_parts.append(link_text)
+                    end = start + len(link_text)
+                    hyperlinks.append((start, end, url))
+                    current_pos = end
+                
+                content_parts.append("\n\n")
+            
+            content_parts.append("\n")
+        
+        # Build all requests
+        full_content = "".join(content_parts)
+        requests = [
+            {"insertText": {"location": {"index": 1}, "text": full_content}}
+        ]
+        
+        # Add hyperlinks in reverse order
+        for start_idx, end_idx, url in reversed(hyperlinks):
+            requests.append({
+                "updateTextStyle": {
+                    "range": {
+                        "startIndex": start_idx + 1,
+                        "endIndex": end_idx + 1
+                    },
+                    "textStyle": {"link": {"url": url}},
+                    "fields": "link"
+                }
+            })
+        
+        return requests
+
     def _render_report(self, report: Report) -> str:
-        content, _ = self._render_report_with_links(report)
-        return content
+        """Generate text preview for review (not for final doc)"""
+        lines = []
+        lines.append(f"RESUMEN: {report.executive_summary_es}\n")
+        
+        category_order = ["new_models", "research", "robots", "funding", "apps", "general"]
+        
+        for cat_id in category_order:
+            cat_items = [i for i in report.items if i.category == cat_id]
+            if not cat_items:
+                continue
+            
+            cat_name = CATEGORIES[cat_id]["name_es"]
+            lines.append(f"\n{cat_name}\n")
+            
+            for item in cat_items:
+                priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.priority, "")
+                lines.append(f"{priority_icon} {item.topic}")
+                lines.append(f"Resumen: {item.summary[:200]}")
+                fuentes = [s.sender.split("<")[0].strip() for s in item.sources]
+                lines.append(f"Fuentes: {', '.join(fuentes[:3])}")
+                lines.append("")
+        
+        return "\n".join(lines)
 
     def _render_report_with_links(self, report: Report) -> Tuple[str, List[Tuple[int, int, str]]]:
         """Returns (content_text, list of (start_idx, end_idx, url))"""
