@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/superagente86/__init__.py
+src/superagente86/analysis_agent.py
+src/superagente86/cli.py
+src/superagente86/config.py
+src/superagente86/delivery_agent.py
+src/superagente86/gmail_agent.py
+src/superagente86/pipeline.py
+src/superagente86.egg-info/PKG-INFO
+src/superagente86.egg-info/SOURCES.txt
+src/superagente86.egg-info/dependency_links.txt
+src/superagente86.egg-info/requires.txt
+src/superagente86.egg-info/top_level.txt

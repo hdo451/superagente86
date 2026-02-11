@@ -94,44 +94,51 @@ class DeliveryAgent:
 
     def _render_report(self, report: Report) -> str:
         lines = []
-        lines.append(f"Reporte generado: {report.generated_at.isoformat()}")
+        lines.append(f"Reporte: {report.generated_at.strftime('%Y-%m-%d %H:%M')}")
         lines.append("")
+        
         if report.executive_summary_es or report.executive_summary_en:
-            lines.append("Resumen ejecutivo (ES):")
-            lines.append(report.executive_summary_es)
+            lines.append("━━━ RESUMEN ━━━")
+            lines.append(f"ES: {report.executive_summary_es}")
+            lines.append(f"EN: {report.executive_summary_en}")
             lines.append("")
-            lines.append("Executive summary (EN):")
-            lines.append(report.executive_summary_en)
-            lines.append("")
-        lines.append("Items:")
-        for item in report.items:
-            lines.extend(self._render_item(item))
-        lines.append("")
+        
+        for i, item in enumerate(report.items, 1):
+            lines.extend(self._render_item(item, i))
+        
         return "\n".join(lines)
 
-    def _render_item(self, item: ReportItem) -> List[str]:
+    def _render_item(self, item: ReportItem, index: int) -> List[str]:
         lines = [
-            f"- {item.topic}",
-            f"  Priority: {item.priority}",
-            f"  Tags: {', '.join(item.tags)}",
-            f"  ES: {item.summary_es}",
-            f"  EN: {item.summary_en}",
-            "  Fuentes:",
+            f"\n{index}. {item.topic.upper()}",
+            f"   [Priority: {item.priority.upper()} | Tags: {', '.join(item.tags)}]",
+            "",
+            f"   {item.summary_es}",
+            "",
         ]
+        
+        # Render sources compactly
         for source in item.sources:
             lines.extend(self._render_source(source))
-        lines.append("")
+        
         return lines
 
     def _render_source(self, source: ReportSource) -> List[str]:
+        sender_short = source.sender.split("<")[0].strip() if "<" in source.sender else source.sender
+        time_str = source.received_at.strftime("%m-%d %H:%M")
+        
         lines = [
-            f"    - {source.sender} ({source.received_at.isoformat()})",
-            f"      Email: {source.email_link}",
-            f"      ES: {source.summary_es}",
-            f"      EN: {source.summary_en}",
+            f"   📧 {sender_short} ({time_str})",
+            f"      └─ {source.summary_es[:100]}..." if len(source.summary_es) > 100 else f"      └─ {source.summary_es}",
         ]
+        
         if source.extracted_links:
-            lines.append("      Links:")
-            for link in source.extracted_links:
-                lines.append(f"        - {link}")
+            links_str = " | ".join(source.extracted_links[:3])
+            if len(source.extracted_links) > 3:
+                links_str += f" + {len(source.extracted_links) - 3} more"
+            lines.append(f"      🔗 {links_str}")
+        
+        lines.append(f"      📌 {source.email_link}")
+        lines.append("")
+        
         return lines

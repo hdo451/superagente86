@@ -18,15 +18,19 @@ class Pipeline:
         self._app_config = app_config
         self._google_config = google_config
         self._analysis = AnalysisAgent()
+        
+        # Combine all scopes for unified auth
+        combined_scopes = list(set(google_config.gmail_scopes + google_config.docs_scopes))
+        
         self._gmail = GmailAgent(
             credentials_path=google_config.credentials_path,
             token_path=google_config.token_path,
-            scopes=google_config.gmail_scopes,
+            scopes=combined_scopes,
         )
         self._delivery = DeliveryAgent(
             credentials_path=google_config.credentials_path,
             token_path=google_config.token_path,
-            scopes=google_config.docs_scopes,
+            scopes=combined_scopes,
         )
 
     def run(

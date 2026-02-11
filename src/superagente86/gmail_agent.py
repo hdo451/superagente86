@@ -153,12 +153,12 @@ class GmailAgent:
         return parts
 
     def _extract_links_from_text(self, text: str) -> List[str]:
-        candidates = re.findall(r"https?://[^\s\)\]>"]+", text)
+        candidates = re.findall(r"https?://[^\s\)\]>\"]+", text)
         return [self._clean_link(link) for link in candidates]
 
     def _extract_links_from_html(self, html: str) -> List[str]:
         hrefs = re.findall(r"href=[\"'](https?://[^\"']+)[\"']", html, re.I)
-        urls = re.findall(r"https?://[^\s\)\]>"]+", html)
+        urls = re.findall(r"https?://[^\s\)\]>\"]+", html)
         candidates = hrefs + urls
         return [self._clean_link(link) for link in candidates]
 
