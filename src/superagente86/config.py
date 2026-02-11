@@ -74,7 +74,7 @@ def load_app_config(path: str) -> AppConfig:
 
 def load_google_config() -> GoogleConfig:
     gmail_scopes = os.getenv("GMAIL_SCOPES", "").split() or [
-        "https://www.googleapis.com/auth/gmail.readonly"
+        "https://www.googleapis.com/auth/gmail.modify"
     ]
     docs_scopes = os.getenv("DOCS_SCOPES", "").split() or [
         "https://www.googleapis.com/auth/documents"

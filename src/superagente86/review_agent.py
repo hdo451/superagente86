@@ -41,27 +41,27 @@ class ReviewAgent:
                 summary="Review disabled (no API key)"
             )
 
-        prompt = """Eres un revisor de documentos. Analiza el siguiente reporte de newsletters y evalúa:
+        prompt = """You are a document reviewer. Analyze the following newsletter report and evaluate:
 
-1. ¿Es fácil de leer y entender?
-2. ¿La estructura es clara?
-3. ¿Hay información redundante o confusa?
-4. ¿Los resúmenes son útiles?
-5. ¿Falta algo importante?
+1. Is it easy to read and understand?
+2. Is the structure clear?
+3. Is there redundant or confusing information?
+4. Are the summaries useful and accurate?
+5. CRITICAL: For each headline+summary pair, verify that the summary actually relates to the headline. Flag any mismatches where the body text doesn't match its headline.
 
-Responde en español con este formato exacto:
-CALIDAD: [BUENA/REGULAR/MALA]
-PROBLEMAS:
-- problema 1
-- problema 2
-SUGERENCIAS:
-- sugerencia 1
-- sugerencia 2
-RESUMEN: [una línea resumiendo tu evaluación]
+Respond in English with this exact format:
+QUALITY: [GOOD/FAIR/POOR]
+ISSUES:
+- issue 1
+- issue 2
+SUGGESTIONS:
+- suggestion 1
+- suggestion 2
+SUMMARY: [one line summarizing your evaluation]
 
-Si no hay problemas, escribe "Ninguno" en PROBLEMAS.
+If there are no issues, write "None" under ISSUES.
 
-DOCUMENTO A REVISAR:
+DOCUMENT TO REVIEW:
 """
         try:
             response = self._model.generate_content(prompt + content[:8000])
@@ -69,9 +69,9 @@ DOCUMENTO A REVISAR:
         except Exception as e:
             return ReviewFeedback(
                 is_good=True,
-                issues=[f"Error en revisión: {str(e)}"],
+                issues=[f"Review error: {str(e)}"],
                 suggestions=[],
-                summary="No se pudo completar la revisión"
+                summary="Could not complete review"
             )
 
     def review_document_image(self, image_bytes: bytes) -> ReviewFeedback:
@@ -84,25 +84,25 @@ DOCUMENTO A REVISAR:
                 summary="Review disabled (no API key)"
             )
 
-        prompt = """Eres un revisor de diseño de documentos. Mira esta imagen de un reporte y evalúa:
+        prompt = """You are a document design reviewer. Look at this image of a report and evaluate:
 
-1. ¿Es visualmente atractivo y fácil de escanear?
-2. ¿La jerarquía visual es clara (títulos, secciones)?
-3. ¿Hay demasiado texto junto?
-4. ¿Los espacios en blanco son adecuados?
-5. ¿Se distinguen bien las secciones?
+1. Is it visually appealing and easy to scan?
+2. Is the visual hierarchy clear (titles, sections)?
+3. Is there too much text together?
+4. Is the whitespace adequate?
+5. Are the sections clearly distinguished?
 
-Responde en español con este formato exacto:
-CALIDAD: [BUENA/REGULAR/MALA]
-PROBLEMAS:
-- problema 1
-- problema 2
-SUGERENCIAS:
-- sugerencia 1
-- sugerencia 2
-RESUMEN: [una línea resumiendo tu evaluación visual]
+Respond in English with this exact format:
+QUALITY: [GOOD/FAIR/POOR]
+ISSUES:
+- issue 1
+- issue 2
+SUGGESTIONS:
+- suggestion 1
+- suggestion 2
+SUMMARY: [one line summarizing your visual evaluation]
 
-Si no hay problemas, escribe "Ninguno" en PROBLEMAS.
+If there are no issues, write "None" under ISSUES.
 """
         try:
             image = Image.open(io.BytesIO(image_bytes))
@@ -111,9 +111,9 @@ Si no hay problemas, escribe "Ninguno" en PROBLEMAS.
         except Exception as e:
             return ReviewFeedback(
                 is_good=True,
-                issues=[f"Error en revisión visual: {str(e)}"],
+                issues=[f"Visual review error: {str(e)}"],
                 suggestions=[],
-                summary="No se pudo completar la revisión visual"
+                summary="Could not complete visual review"
             )
 
     def _parse_response(self, text: str) -> ReviewFeedback:
@@ -127,19 +127,19 @@ Si no hay problemas, escribe "Ninguno" en PROBLEMAS.
         section = None
         for line in lines:
             line = line.strip()
-            if line.startswith("CALIDAD:"):
-                quality = line.replace("CALIDAD:", "").strip().upper()
-                is_good = quality == "BUENA"
-            elif line.startswith("PROBLEMAS:"):
+            if line.startswith("QUALITY:") or line.startswith("CALIDAD:"):
+                quality = line.split(":", 1)[1].strip().upper()
+                is_good = quality in ("GOOD", "BUENA")
+            elif line.startswith("ISSUES:") or line.startswith("PROBLEMAS:"):
                 section = "problems"
-            elif line.startswith("SUGERENCIAS:"):
+            elif line.startswith("SUGGESTIONS:") or line.startswith("SUGERENCIAS:"):
                 section = "suggestions"
-            elif line.startswith("RESUMEN:"):
-                summary = line.replace("RESUMEN:", "").strip()
+            elif line.startswith("SUMMARY:") or line.startswith("RESUMEN:"):
+                summary = line.split(":", 1)[1].strip()
                 section = None
             elif line.startswith("- ") or line.startswith("• "):
                 item = line[2:].strip()
-                if item.lower() != "ninguno":
+                if item.lower() not in ("ninguno", "none"):
                     if section == "problems":
                         issues.append(item)
                     elif section == "suggestions":
@@ -149,5 +149,5 @@ Si no hay problemas, escribe "Ninguno" en PROBLEMAS.
             is_good=is_good,
             issues=issues,
             suggestions=suggestions,
-            summary=summary or "Revisión completada"
+            summary=summary or "Review completed"
         )

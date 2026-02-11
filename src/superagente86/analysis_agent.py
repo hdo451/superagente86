@@ -5,7 +5,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import google.generativeai as genai
@@ -14,22 +14,11 @@ from .gmail_agent import GmailMessage
 
 
 @dataclass
-class ReportSource:
-    sender: str
-    received_at: dt.datetime
-    email_link: str
-    extracted_links: List[str]
-    video_links: List[str] = field(default_factory=list)
-
-
-@dataclass
 class ReportItem:
     """A single news item extracted from a newsletter."""
     titular: str
     cuerpo: str
     fuente: str  # Newsletter name (e.g. "The Neuron", "TLDR AI")
-    enlaces: List[str]
-    email_link: str
     source_priority: int = 99  # Lower = higher priority
 
 
@@ -46,7 +35,7 @@ CATEGORIES = {
 @dataclass
 class Report:
     generated_at: dt.datetime
-    executive_summary_es: str
+    executive_summary: str
     items: List[ReportItem]
 
 
@@ -82,14 +71,14 @@ class AnalysisAgent:
         # Deduplicate: keep first occurrence (highest priority source)
         all_items = self._deduplicate(all_items)
 
-        exec_es = ""
+        exec_summary = ""
         if include_exec_summary and all_items:
             sources = set(it.fuente for it in all_items)
-            exec_es = f"{len(all_items)} noticias de {len(sources)} newsletters."
+            exec_summary = f"{len(all_items)} news items from {len(sources)} newsletters."
 
         return Report(
             generated_at=dt.datetime.now(dt.timezone.utc),
-            executive_summary_es=exec_es,
+            executive_summary=exec_summary,
             items=all_items,
         )
 
@@ -112,7 +101,7 @@ class AnalysisAgent:
                     raise
                 if "429" in err_str and attempt < max_retries:
                     wait = 15 * (attempt + 1)
-                    print(f"   ⏳ Rate limit, esperando {wait}s...")
+                    print(f"   ⏳ Rate limit, waiting {wait}s...")
                     time.sleep(wait)
                 else:
                     raise
@@ -125,9 +114,6 @@ class AnalysisAgent:
         """Use Gemini to extract individual news from a newsletter email."""
         fuente = self._extract_source_name(message.sender)
         priority = self._get_source_priority(fuente)
-        email_link = message.link
-        video_links = self._extract_video_links(message.links)
-        other_links = [l for l in message.links if l not in video_links]
 
         body = message.body_text or message.snippet or ""
         body = self._strip_footer(body)
@@ -136,24 +122,26 @@ class AnalysisAgent:
             return self._fallback_extract(message, fuente, priority)
 
         prompt = (
-            "Eres un asistente que extrae noticias individuales de newsletters de tecnología/IA.\n"
-            "Analiza el siguiente email y extrae CADA noticia individual.\n"
-            "Para cada noticia devuelve:\n"
-            '- "titular": titular corto y claro en español (máx 12 palabras)\n'
-            '- "cuerpo": resumen en español de 2-3 oraciones. Debe explicar claramente qué pasó, '
-            "quién está involucrado y por qué importa. NO incluyas texto de pie de página, "
-            "enlaces, ni contenido promocional.\n\n"
-            "REGLAS:\n"
-            "- Máximo 5 noticias por newsletter. Prioriza las más importantes.\n"
-            "- Ignora publicidad, ofertas de trabajo, secciones de referidos, pie de página.\n"
-            "- Ignora secciones tipo 'Prompt of the day' o 'Meme of the day'.\n"
-            "- Solo extrae noticias reales con información sustancial.\n"
-            "- Si no hay noticias claras, devuelve un array vacío.\n"
-            "- Responde SOLO con un JSON array válido, sin markdown ni explicaciones.\n\n"
+            "You are an assistant that extracts individual news stories from tech/AI newsletters.\n"
+            "Analyze the following email and extract EACH individual news story.\n"
+            "For each story return:\n"
+            '- "titular": short, clear headline in English (max 12 words)\n'
+            '- "cuerpo": summary in English, 2-3 sentences. Must clearly explain what happened, '
+            "who is involved, and why it matters. Do NOT include footer text, links, or promotional content.\n\n"
+            "RULES:\n"
+            "- Extract ALL news items from the newsletter (up to 25). Do not skip any real news.\n"
+            "- PAY SPECIAL ATTENTION to sections like 'Here\'s what happened in AI today' or "
+            "'Top stories' — these contain the most important news and MUST be extracted.\n"
+            "- Ignore ads, job offers, referral sections, footers, memes, prompts of the day.\n"
+            "- Only extract real news with substantial information.\n"
+            "- The headline (titular) MUST match the body (cuerpo). If the body doesn't relate "
+            "to the headline, fix it or skip that item.\n"
+            "- If no clear news items exist, return an empty array.\n"
+            "- Respond ONLY with a valid JSON array, no markdown or explanations.\n\n"
             f"Newsletter: {fuente}\n"
-            f"Asunto: {message.subject}\n\n"
-            f"Contenido:\n{body[:6000]}\n\n"
-            'Responde SOLO con JSON: [{"titular": "...", "cuerpo": "..."}]'
+            f"Subject: {message.subject}\n\n"
+            f"Content:\n{body[:12000]}\n\n"
+            'Respond ONLY with JSON: [{"titular": "...", "cuerpo": "..."}]'
         )
 
         try:
@@ -170,21 +158,16 @@ class AnalysisAgent:
             return self._fallback_extract(message, fuente, priority)
 
         items: List[ReportItem] = []
-        for entry in parsed[:5]:  # Max 5 items per newsletter
+        for entry in parsed[:25]:  # Max 25 items per newsletter
             titular = (entry.get("titular") or "").strip()
             cuerpo = (entry.get("cuerpo") or "").strip()
             if not titular or not cuerpo or len(cuerpo) < 20:
                 continue
 
-            # Assign relevant links from the email
-            enlaces = list(video_links[:2]) + list(other_links[:2])
-
             items.append(ReportItem(
                 titular=titular,
                 cuerpo=cuerpo,
                 fuente=fuente,
-                enlaces=enlaces[:4],
-                email_link=email_link,
                 source_priority=priority,
             ))
 
@@ -193,30 +176,22 @@ class AnalysisAgent:
     def _fallback_extract(self, message: GmailMessage, fuente: str, priority: int) -> List[ReportItem]:
         """Regex-based fallback when Gemini is unavailable."""
         subject = message.subject.strip()
-        # Clean subject: remove emojis and newsletter prefixes
         subject = re.sub(r'^[^\w]*', '', subject).strip()
         subject = subject[:80] if len(subject) > 80 else subject
 
         body = message.body_text or message.snippet or ""
         body = self._strip_footer(body)
-        # Clean body: remove URLs, artifacts, take first meaningful chunk
         body = re.sub(r'https?://\S+', '', body)
         body = re.sub(r'[\u200b\u200c\u200d\u2060\ufeff\u00ad]+', '', body)
         body = re.sub(r'\s+', ' ', body).strip()
-        # Take first 300 chars that look like actual content
         cuerpo = body[:300].strip()
         if len(cuerpo) < 20:
-            cuerpo = f"Newsletter de {fuente}: {subject}"
-
-        video_links = self._extract_video_links(message.links)
-        other_links = [l for l in message.links if l not in video_links]
+            cuerpo = f"Newsletter from {fuente}: {subject}"
 
         return [ReportItem(
             titular=subject,
             cuerpo=cuerpo,
             fuente=fuente,
-            enlaces=(video_links[:2] + other_links[:2])[:4],
-            email_link=message.link,
             source_priority=priority,
         )]
 
@@ -225,7 +200,8 @@ class AnalysisAgent:
     # ------------------------------------------------------------------
 
     def _deduplicate(self, items: List[ReportItem]) -> List[ReportItem]:
-        """Remove duplicate news across newsletters. Items are pre-sorted by priority."""
+        """Merge duplicate news across newsletters. Items are pre-sorted by priority.
+        When a duplicate is found, its source name is appended to the existing item's fuente."""
         unique: List[ReportItem] = []
         seen_keys: List[set] = []
 
@@ -245,17 +221,22 @@ class AnalysisAgent:
                 seen_keys.append(words)
                 continue
 
-            is_dup = False
-            for seen in seen_keys:
+            dup_index = -1
+            for idx, seen in enumerate(seen_keys):
                 if not seen:
                     continue
                 common = words & seen
                 ratio = len(common) / min(len(words), len(seen)) if min(len(words), len(seen)) > 0 else 0
                 if ratio >= 0.5 and len(common) >= 2:
-                    is_dup = True
+                    dup_index = idx
                     break
 
-            if not is_dup:
+            if dup_index >= 0:
+                # Merge: append this source to the existing item's SOURCE column
+                existing = unique[dup_index]
+                if item.fuente not in existing.fuente:
+                    existing.fuente = f"{existing.fuente}, {item.fuente}"
+            else:
                 unique.append(item)
                 seen_keys.append(words)
 
@@ -276,11 +257,6 @@ class AnalysisAgent:
             if key in fuente_lower:
                 return prio
         return 99
-
-    @staticmethod
-    def _extract_video_links(links: List[str]) -> List[str]:
-        video_domains = ["youtube.com", "youtu.be", "vimeo.com"]
-        return [l for l in links if any(d in l.lower() for d in video_domains)]
 
     @staticmethod
     def _strip_footer(text: str) -> str:

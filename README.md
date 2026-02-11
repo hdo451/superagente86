@@ -1,40 +1,65 @@
 # Superagente86
 
-Pipeline en Python para leer newsletters desde Gmail (etiqueta `newsletters`), agrupar por tema exacto, extraer links y crear un Google Doc con el resumen dos veces al dia.
+Python pipeline that reads AI/tech newsletters from Gmail (label `newsletters`), extracts individual news items using Gemini, deduplicates across sources, and creates a Google Doc with a structured table report twice a day.
 
-## Requisitos
+## Features
+
+- **Gemini-powered extraction**: Each newsletter is analyzed by Gemini to extract individual news stories with clear headlines and summaries in English.
+- **Real Google Docs table**: 3-column table (HEADLINE, SUMMARY, SOURCE) with bold headers.
+- **Source priority**: The Neuron > TLDR AI > The Rundown AI > Superhuman > TLDR. Higher-priority sources win when deduplicating.
+- **Quality review**: Gemini reviews the report for coherence (headline must match summary).
+- **Automatic scheduling**: Runs at 08:30 and 13:30 daily via macOS launchd.
+
+## Requirements
 
 - Python 3.10+
-- Credenciales OAuth de Google (Gmail API y Google Docs API habilitadas)
+- Google OAuth credentials (Gmail API + Google Docs API enabled)
+- Gemini API key
 
-## Setup rapido
+## Quick Setup
 
-1. Crea un entorno virtual e instala dependencias:
+1. Create a virtual environment and install:
 
+   ```
    python -m venv .venv
    source .venv/bin/activate
-   pip install -r requirements.txt
+   pip install -e .
+   ```
 
-2. Copia `.env.example` a `.env` y ajusta rutas si es necesario.
-3. Coloca `credentials.json` en la raiz del proyecto.
-4. Ejecuta el pipeline por primera vez para generar `token.json`:
+2. Copy `.env.example` to `.env` and set your paths and API keys.
+3. Place `credentials.json` in the project root.
+4. First run (generates `token.json`):
 
+   ```
    python -m superagente86.cli --config config.yaml --dry-run
+   ```
 
-5. Ejecuta en modo normal:
+5. Normal run:
 
+   ```
    python -m superagente86.cli --config config.yaml
+   ```
 
-## Configuracion
+## Automatic Scheduling
 
-- La etiqueta Gmail se define en `config.yaml` como `label: newsletters`.
-- Horarios sugeridos: 08:30 y 13:30 (zona horaria US/Pacific).
-- Cada ejecucion usa ventana por horario: 08:30 toma desde 13:30 del dia anterior; 13:30 toma desde 08:30 del mismo dia.
-- El reporte se crea como un Google Doc nuevo por ejecucion.
-- Las noticias repetidas se agrupan por tema exacto (subject normalizado).
-- Cada noticia incluye fuentes y links extraidos del correo.
-- En cada ejecucion se crea un acceso directo en el Escritorio al Google Doc.
+To install the automatic schedule (08:30 and 13:30 daily):
 
-## Siguiente paso (scheduler)
+```
+./install_schedule.sh
+```
 
-Puedes usar cron o GitHub Actions para ejecutar dos veces al dia. Si quieres, lo agrego en la siguiente iteracion.
+This creates a macOS launchd agent. Logs go to `logs/`.
+
+To uninstall:
+```
+launchctl bootout gui/$(id -u)/com.superagente86.newsletter
+```
+
+## Configuration
+
+- Gmail label: defined in `config.yaml` as `label: newsletters`
+- Schedule: 08:30 and 13:30 (US/Pacific timezone)
+- Each run uses a time window based on the schedule
+- A new Google Doc is created per run
+- Duplicate news across newsletters is deduplicated by headline similarity
+- A desktop shortcut (.webloc) to the Google Doc is created automatically

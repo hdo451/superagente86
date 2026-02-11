@@ -53,15 +53,15 @@ class DeliveryAgent:
 
         items = report.items
         num_rows = len(items) + 1  # +1 for header row
-        num_cols = 4
+        num_cols = 3
 
         # --- Step 1: Insert a header line, then the table ---
         header_text = (
-            f"REPORTE DE NEWSLETTERS\n"
+            f"NEWSLETTER REPORT\n"
             f"{report.generated_at.strftime('%Y-%m-%d %H:%M')}\n"
         )
-        if report.executive_summary_es:
-            header_text += f"{report.executive_summary_es}\n"
+        if report.executive_summary:
+            header_text += f"{report.executive_summary}\n"
         header_text += "\n"
 
         service.documents().batchUpdate(
@@ -92,15 +92,13 @@ class DeliveryAgent:
         cell_indices = self._extract_cell_indices(doc_struct)
 
         # --- Step 3: Build cell data ---
-        header_row = ["TITULAR", "CUERPO", "FUENTE", "ENLACES"]
+        header_row = ["HEADLINE", "SUMMARY", "SOURCE"]
         data_rows = []
         for item in items:
-            enlaces_text = self._format_enlaces(item)
             data_rows.append([
                 item.titular,
                 item.cuerpo,
                 item.fuente,
-                enlaces_text,
             ])
 
         all_rows = [header_row] + data_rows
@@ -193,28 +191,16 @@ class DeliveryAgent:
                         break
         return requests
 
-    @staticmethod
-    def _format_enlaces(item: ReportItem) -> str:
-        """Format links for the ENLACES cell."""
-        parts = []
-        for link in item.enlaces[:3]:
-            if "youtu" in link.lower():
-                parts.append(f"Video: {link}")
-            else:
-                parts.append(link)
-        parts.append(f"Email: {item.email_link}")
-        return "\n".join(parts)
-
     # ------------------------------------------------------------------
     # Preview for review agent (text only, no Google Docs)
     # ------------------------------------------------------------------
 
     def _render_report(self, report: Report) -> str:
-        lines = [f"RESUMEN: {report.executive_summary_es}\n"]
+        lines = [f"SUMMARY: {report.executive_summary}\n"]
         for item in report.items:
             lines.append(f"- {item.titular}")
             lines.append(f"  {item.cuerpo}")
-            lines.append(f"  Fuente: {item.fuente}")
+            lines.append(f"  Source: {item.fuente}")
             lines.append("")
         return "\n".join(lines)
 

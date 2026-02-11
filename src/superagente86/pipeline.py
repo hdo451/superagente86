@@ -66,23 +66,33 @@ class Pipeline:
         if self._review.enabled:
             content_preview = self._delivery._render_report(report)
             review_feedback = self._review.review_document_text(content_preview)
-            print(f"\n📋 REVISIÓN DEL DOCUMENTO:")
-            print(f"   Calidad: {'✅ Buena' if review_feedback.is_good else '⚠️ Mejorable'}")
+            print(f"\n📋 DOCUMENT REVIEW:")
+            print(f"   Quality: {'✅ Good' if review_feedback.is_good else '⚠️ Needs improvement'}")
             if review_feedback.issues:
-                print(f"   Problemas detectados:")
+                print(f"   Issues detected:")
                 for issue in review_feedback.issues:
                     print(f"      - {issue}")
             if review_feedback.suggestions:
-                print(f"   Sugerencias:")
+                print(f"   Suggestions:")
                 for suggestion in review_feedback.suggestions:
                     print(f"      - {suggestion}")
-            print(f"   Resumen: {review_feedback.summary}")
+            print(f"   Summary: {review_feedback.summary}")
             print()
 
         doc_id = None
         shortcut_path = None
         if not dry_run:
             doc_id = self._delivery.create_report_doc(report, title_prefix=title_prefix)
+
+            # Mark processed emails as read
+            message_ids = [m.message_id for m in messages]
+            if message_ids:
+                try:
+                    self._gmail.mark_as_read(message_ids)
+                    print(f"   ✅ Marked {len(message_ids)} emails as read")
+                except Exception as e:
+                    print(f"   ⚠️ Could not mark emails as read: {e}")
+
             if self._app_config.shortcut.enabled and doc_id:
                 shortcut_path = self._delivery.create_doc_shortcut(
                     doc_id, self._app_config.shortcut
