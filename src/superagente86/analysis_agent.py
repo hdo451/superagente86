@@ -28,9 +28,53 @@ class ReportItem:
     priority: str
     summary: str
     sources: List[ReportSource]
+    category: str = "general"  # new_models, research, robots, funding, apps, general
     has_prompt: bool = False
     has_video: bool = False
     has_company_news: bool = False
+
+
+# Category definitions for AI news
+CATEGORIES = {
+    "new_models": {
+        "name_es": "🚀 NUEVOS MODELOS",
+        "name_en": "New Models",
+        "keywords": ["gpt-5", "gpt-4", "claude", "gemini", "llama", "mistral", "model release", 
+                     "new model", "launches", "released", "announced", "upgrade", "version",
+                     "multimodal", "foundation model", "weights", "open source", "fine-tun"],
+    },
+    "research": {
+        "name_es": "🔬 RESEARCH",
+        "name_en": "Research",
+        "keywords": ["paper", "arxiv", "research", "study", "breakthrough", "discovered",
+                     "technique", "algorithm", "benchmark", "state-of-the-art", "sota",
+                     "training", "inference", "reasoning", "evaluation", "dataset"],
+    },
+    "robots": {
+        "name_es": "🤖 ROBOTS",
+        "name_en": "Robots",
+        "keywords": ["robot", "humanoid", "boston dynamics", "figure", "optimus", "tesla bot",
+                     "autonomous", "embodied", "manipulation", "locomotion", "actuator",
+                     "warehouse", "industrial robot", "cobot"],
+    },
+    "funding": {
+        "name_es": "💰 FUNDING & EMPRESAS",
+        "name_en": "Funding & Companies",
+        "keywords": ["raised", "funding", "series", "valuation", "acquisition", "acquired",
+                     "ipo", "merger", "billion", "million", "investor", "venture", "startup"],
+    },
+    "apps": {
+        "name_es": "🛠️ APPS & TOOLS",
+        "name_en": "Apps & Tools",
+        "keywords": ["app", "tool", "plugin", "extension", "api", "sdk", "platform",
+                     "saas", "product", "feature", "integration", "workflow", "automation"],
+    },
+    "general": {
+        "name_es": "📰 GENERAL",
+        "name_en": "General",
+        "keywords": [],
+    },
+}
 
 
 @dataclass
@@ -44,7 +88,11 @@ class Report:
 class AnalysisAgent:
     def analyze(self, messages: List[GmailMessage], include_exec_summary: bool) -> Report:
         grouped = self._group_by_topic(messages)
-        items = [self._build_item(topic, items) for topic, items in grouped.items()]
+        items = [self._build_item(topic, msgs) for topic, msgs in grouped.items()]
+        
+        # Deduplicate similar news across categories
+        items = self._deduplicate_items(items)
+        
         exec_es, exec_en = (
             self._build_exec_summary(items) if include_exec_summary else ("", "")
         )
@@ -54,6 +102,46 @@ class AnalysisAgent:
             executive_summary_en=exec_en,
             items=items,
         )
+
+    def _deduplicate_items(self, items: List[ReportItem]) -> List[ReportItem]:
+        """Remove duplicate news that appear in multiple categories"""
+        seen_topics = {}
+        unique_items = []
+        
+        # Sort by priority to keep the highest priority version
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        sorted_items = sorted(items, key=lambda x: priority_order.get(x.priority, 2))
+        
+        for item in sorted_items:
+            # Create a normalized key from significant topic words
+            topic_words = item.topic.lower().split()
+            # Remove common words
+            stopwords = {"the", "a", "an", "and", "or", "of", "to", "in", "for", "is", "are", 
+                         "ai", "news", "update", "daily", "weekly", "newsletter", "today",
+                         "this", "that", "with", "from", "your", "on", "at", "by"}
+            key_words = set(w for w in topic_words if w not in stopwords and len(w) > 2)
+            
+            if not key_words:
+                unique_items.append(item)
+                continue
+            
+            # Check if similar topic already exists
+            is_duplicate = False
+            for seen_key, seen_item in seen_topics.items():
+                common = key_words & seen_key
+                # If more than 40% of significant words match, it's likely the same news
+                match_ratio = len(common) / max(len(key_words), 1)
+                if match_ratio >= 0.4 and len(common) >= 2:
+                    # Merge sources into the existing item
+                    seen_item.sources.extend(item.sources)
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                seen_topics[frozenset(key_words)] = item
+                unique_items.append(item)
+        
+        return unique_items
 
     def _group_by_topic(self, messages: List[GmailMessage]) -> Dict[str, List[GmailMessage]]:
         grouped: Dict[str, List[GmailMessage]] = {}
@@ -88,7 +176,11 @@ class AnalysisAgent:
         if has_video:
             tags.append("video")
         
-        priority = self._score_priority(tags, has_company_news)
+        # Classify into category
+        combined_text = " ".join(m.subject + " " + (m.body_text or m.snippet) for m in messages)
+        category = self._classify_category(combined_text)
+        
+        priority = self._score_priority(tags, has_company_news, category)
         primary = messages[0]
         summary = self._summarize(primary, priority)
         
@@ -98,10 +190,29 @@ class AnalysisAgent:
             tags=list(set(tags)),
             priority=priority,
             sources=sources,
+            category=category,
             has_prompt=has_prompt,
             has_video=has_video,
             has_company_news=has_company_news,
         )
+
+    def _classify_category(self, text: str) -> str:
+        """Classify text into one of the AI news categories"""
+        text_lower = text.lower()
+        scores = {}
+        
+        for cat_id, cat_info in CATEGORIES.items():
+            if cat_id == "general":
+                continue
+            score = sum(1 for kw in cat_info["keywords"] if kw in text_lower)
+            if score > 0:
+                scores[cat_id] = score
+        
+        if not scores:
+            return "general"
+        
+        # Return category with highest score
+        return max(scores, key=scores.get)
 
     def _build_source(self, message: GmailMessage) -> ReportSource:
         text = message.body_text or message.snippet
@@ -145,10 +256,12 @@ class AnalysisAgent:
             tags.append("general")
         return tags
 
-    def _score_priority(self, tags: List[str], has_company_news: bool = False) -> str:
-        if "funding" in tags or has_company_news:
+    def _score_priority(self, tags: List[str], has_company_news: bool = False, category: str = "general") -> str:
+        # High priority: funding news, new models, company announcements
+        if "funding" in tags or has_company_news or category in ("funding", "new_models"):
             return "high"
-        if "ai" in tags or "company" in tags:
+        # Medium: research, robots, AI-related
+        if "ai" in tags or "company" in tags or category in ("research", "robots"):
             return "medium"
         return "low"
 
@@ -156,24 +269,78 @@ class AnalysisAgent:
         text = message.body_text.strip() if message.body_text else message.snippet
         text = self._clean_text(text)
         
-        # More words for important news
-        word_limit = 50 if priority == "high" else 30
+        # Remove duplicated sentences
+        sentences = text.split('.')
+        seen = set()
+        unique_sentences = []
+        for s in sentences:
+            s_clean = s.strip().lower()
+            if s_clean and s_clean not in seen and len(s_clean) > 10:
+                seen.add(s_clean)
+                unique_sentences.append(s.strip())
+        
+        text = '. '.join(unique_sentences[:3])  # Max 3 sentences
+        if text and not text.endswith('.'):
+            text += '.'
+        
+        # Limit to reasonable length
+        word_limit = 40 if priority == "high" else 25
         words = text.split()
         if len(words) > word_limit:
             return " ".join(words[:word_limit]) + "..."
-        return text
+        return text if text else "(sin resumen)"
 
     def _summarize_source(self, message: GmailMessage) -> str:
-        text = message.body_text.strip() if message.body_text else message.snippet
+        # Use snippet only to avoid duplication with main summary
+        text = message.snippet or ""
         text = self._clean_text(text)
         words = text.split()
-        if len(words) > 40:
-            return " ".join(words[:40]) + "..."
-        return text
+        if len(words) > 25:
+            return " ".join(words[:25]) + "..."
+        return text if text else "(sin extracto)"
 
     def _clean_text(self, text: str) -> str:
-        text = re.sub(r"\s+", " ", text)
-        text = re.sub(r"[\r\n]+", " ", text)
+        # Remove zero-width characters and artifacts
+        text = re.sub(r'[\u200b\u200c\u200d\u2060\ufeff]+', '', text)
+        # Remove ALL image placeholders and patterns
+        text = re.sub(r'View image:.*?(?:Caption:|$)', '', text, flags=re.IGNORECASE|re.DOTALL)
+        text = re.sub(r'Follow image link:.*?(?:\s|$)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\[image\]|\[img\]|\(image\)|Image:', '', text, flags=re.IGNORECASE)
+        # Remove newsletter intro/outro patterns
+        intro_patterns = [
+            r'Welcome back[^.]*\.?',
+            r'Welcome,? \w+[^.]*\.?',
+            r'Happy \w+day[^.]*\.?',
+            r'Good (?:morning|afternoon|evening)[^.]*\.?',
+            r'Hi there[^.]*\.?',
+            r'Hello[^.]*\.?',
+            r'Hey[^.]*\.?',
+            r"Here'?s? (?:what|today)[^.]*\.?",
+            r'In this (?:issue|edition|newsletter)[^.]*\.?',
+            r'Today we[^.]*\.?',
+            r'This week[^.]*\.?',
+        ]
+        for pattern in intro_patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        # Remove promotional/CTA text
+        text = re.sub(r'(?:Sign Up|Subscribe|Unsubscribe|Click here|Read more|View in browser|Advertise|Forward this|Refer a friend|Share this|Sponsor)[^.]*\.?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'(?:Share|Tweet|Post|Like|Follow us|Join us)[^.]{0,30}', '', text, flags=re.IGNORECASE)
+        # Remove URL patterns in text
+        text = re.sub(r'https?://\S*', '', text)
+        text = re.sub(r'www\.\S*', '', text)
+        # Remove email artifacts
+        text = re.sub(r'\(?\s*Caption:\s*\)?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'Refer\s*\|\s*Tldr\s*\|\s*Advertise', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\|\s*Advertise', '', text, flags=re.IGNORECASE)
+        # Remove repeated special chars
+        text = re.sub(r'[\u2022\u2023\u25aa\u25ab\u25cf\u25cb]{2,}', '', text)
+        # Clean whitespace
+        text = re.sub(r'[\r\n\t]+', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        # Remove orphan punctuation and empty parens
+        text = re.sub(r'\s[|:;,]+\s', ' ', text)
+        text = re.sub(r'\(\s*\)', '', text)
+        text = re.sub(r'\[\s*\]', '', text)
         return text.strip()
 
     def _extract_prompt(self, text: str) -> Optional[str]:
@@ -195,39 +362,55 @@ class AnalysisAgent:
 
     def _extract_app_mentions(self, text: str) -> List[str]:
         patterns = [
-            r"(?:try|check out|download|use)\s+([A-Z][a-zA-Z0-9]+)",
-            r"app[:\s]+([A-Z][a-zA-Z0-9]+)",
-            r"tool[:\s]+([A-Z][a-zA-Z0-9]+)",
+            r"(?:try|check out|download|use|introducing)\s+([A-Z][a-zA-Z0-9]{2,}(?:\s+[A-Z][a-zA-Z0-9]+)?)",
+            r"(?:new app|new tool)[:\s]+([A-Z][a-zA-Z0-9]{2,}(?:\s+[A-Z0-9]+)?)",
         ]
         apps = []
+        stopwords = {'the', 'and', 'for', 'with', 'this', 'that', 'your', 'our', 'his', 'her'}
         for pattern in patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
-            apps.extend(matches)
-        return list(set(apps))[:5]
+            for m in matches:
+                cleaned = m.strip()
+                if len(cleaned) > 2 and cleaned.lower() not in stopwords:
+                    apps.append(cleaned)
+        return list(set(apps))[:3]
 
     def _extract_company_news(self, text: str) -> List[str]:
-        keywords = [
-            r"(\w+)\s+(?:announced|launches|raised|acquired|partnership|IPO|valuation)",
-            r"(?:announced|launches|raised|acquired)\s+(?:by\s+)?(\w+)",
-            r"(OpenAI|Google|Microsoft|Meta|Apple|Amazon|Anthropic|Nvidia|Tesla)[^.]{0,100}(?:announced|launch|partner|acqui|fund|invest)",
+        # Look for full sentence fragments with company + action
+        patterns = [
+            r"((?:OpenAI|Google|Microsoft|Meta|Apple|Amazon|Anthropic|Nvidia|Tesla|xAI|Mistral|Cohere)\s+(?:announced|launches|raised|acquired|partners|releases)[^.]{5,80})",
+            r"(\$[\d.]+[MBK]?\s+(?:funding|raised|valuation)[^.]{5,50})",
         ]
         news = []
-        for pattern in keywords:
+        for pattern in patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
-            if matches:
-                for m in matches:
-                    if isinstance(m, tuple):
-                        news.extend([x for x in m if x])
-                    else:
-                        news.append(m)
-        return list(set(news))[:5]
+            for m in matches:
+                cleaned = self._clean_text(m)
+                if len(cleaned) > 15:
+                    news.append(cleaned[:100])
+        return list(set(news))[:3]
 
     def _build_exec_summary(self, items: List[ReportItem]) -> tuple[str, str]:
         if not items:
             return "Sin novedades relevantes.", "No relevant updates."
-        high = sum(1 for item in items if item.priority == "high")
-        medium = sum(1 for item in items if item.priority == "medium")
-        low = sum(1 for item in items if item.priority == "low")
-        es = f"Resumen rapido: {high} alta, {medium} media, {low} baja prioridad."
-        en = f"Quick summary: {high} high, {medium} medium, {low} low priority."
+        
+        # Count by category
+        cat_counts = {}
+        for item in items:
+            cat_counts[item.category] = cat_counts.get(item.category, 0) + 1
+        
+        # Build summary showing category breakdown
+        parts_es = []
+        parts_en = []
+        for cat_id in ["new_models", "research", "robots", "funding", "apps", "general"]:
+            if cat_id in cat_counts:
+                count = cat_counts[cat_id]
+                name_es = CATEGORIES[cat_id]["name_es"].split(" ", 1)[1]  # Remove emoji
+                name_en = CATEGORIES[cat_id]["name_en"]
+                parts_es.append(f"{count} {name_es}")
+                parts_en.append(f"{count} {name_en}")
+        
+        es = f"Hoy: {', '.join(parts_es)}. Total: {len(items)} noticias."
+        en = f"Today: {', '.join(parts_en)}. Total: {len(items)} news."
+        
         return es, en

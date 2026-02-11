@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -11,6 +12,7 @@ from .analysis_agent import AnalysisAgent
 from .config import AppConfig, GoogleConfig
 from .delivery_agent import DeliveryAgent
 from .gmail_agent import GmailAgent
+from .review_agent import ReviewAgent, ReviewFeedback
 
 
 class Pipeline:
@@ -18,6 +20,7 @@ class Pipeline:
         self._app_config = app_config
         self._google_config = google_config
         self._analysis = AnalysisAgent()
+        self._review = ReviewAgent(api_key=os.getenv("GEMINI_API_KEY"))
         
         # Combine all scopes for unified auth
         combined_scopes = list(set(google_config.gmail_scopes + google_config.docs_scopes))
@@ -58,6 +61,24 @@ class Pipeline:
             messages, include_exec_summary=self._app_config.report.include_exec_summary
         )
 
+        # Review content before creating document
+        review_feedback = None
+        if self._review.enabled:
+            content_preview = self._delivery._render_report(report)
+            review_feedback = self._review.review_document_text(content_preview)
+            print(f"\n📋 REVISIÓN DEL DOCUMENTO:")
+            print(f"   Calidad: {'✅ Buena' if review_feedback.is_good else '⚠️ Mejorable'}")
+            if review_feedback.issues:
+                print(f"   Problemas detectados:")
+                for issue in review_feedback.issues:
+                    print(f"      - {issue}")
+            if review_feedback.suggestions:
+                print(f"   Sugerencias:")
+                for suggestion in review_feedback.suggestions:
+                    print(f"      - {suggestion}")
+            print(f"   Resumen: {review_feedback.summary}")
+            print()
+
         doc_id = None
         shortcut_path = None
         if not dry_run:
@@ -72,12 +93,20 @@ class Pipeline:
         state["window_end"] = window_end.isoformat()
         state["last_doc_id"] = doc_id
         state["last_count"] = len(messages)
+        if review_feedback:
+            state["last_review"] = {
+                "is_good": review_feedback.is_good,
+                "issues": review_feedback.issues,
+                "suggestions": review_feedback.suggestions,
+                "summary": review_feedback.summary,
+            }
         self._save_state(state_file, state)
 
         return {
             "doc_id": doc_id,
             "shortcut_path": str(shortcut_path) if shortcut_path else None,
             "items": len(messages),
+            "review": review_feedback,
             "state": state,
         }
 

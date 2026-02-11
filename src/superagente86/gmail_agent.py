@@ -139,8 +139,22 @@ class GmailAgent:
 
         deduped = []
         seen = set()
+        # Filter out tracking and promotional links
+        skip_patterns = [
+            "unsubscribe", "unsub", "optout", "opt-out",
+            "manage-subscription", "preferences",
+            "refer", "referral", "share",
+            "twitter.com/intent", "facebook.com/sharer",
+            "linkedin.com/share", "mailto:",
+            "tracking", "click.", "trk.", "r.", "t.",
+            "list-manage.com", "mailchimp.com",
+            "beehiiv.com", "substack.com/redirect",
+        ]
         for link in links:
             if link in seen:
+                continue
+            link_lower = link.lower()
+            if any(pattern in link_lower for pattern in skip_patterns):
                 continue
             seen.add(link)
             deduped.append(link)

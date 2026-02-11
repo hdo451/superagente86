@@ -10,7 +10,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from .analysis_agent import Report, ReportItem, ReportSource
+from .analysis_agent import Report, ReportItem, ReportSource, CATEGORIES
 from .config import ShortcutConfig
 
 
@@ -144,6 +144,8 @@ class DeliveryAgent:
         add_line("📰 REPORTE DE NEWSLETTERS")
         add_line(f"   {report.generated_at.strftime('%Y-%m-%d %H:%M')}")
         add_line("")
+        add_line("LEYENDA: 🔴 Alta prioridad | 🟡 Media | 💡 Prompt del día | 🎬 Video")
+        add_line("")
         
         if report.executive_summary_es or report.executive_summary_en:
             add_line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -152,37 +154,27 @@ class DeliveryAgent:
             add_line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             add_line("")
         
-        # Group by priority
-        high_items = [i for i in report.items if i.priority == "high"]
-        medium_items = [i for i in report.items if i.priority == "medium"]
-        low_items = [i for i in report.items if i.priority == "low"]
+        # Group by category instead of priority
+        category_order = ["new_models", "research", "robots", "funding", "apps", "general"]
         
         idx = 1
-        if high_items:
-            add_line("🔴 ALTA PRIORIDAD")
+        for cat_id in category_order:
+            cat_items = [i for i in report.items if i.category == cat_id]
+            if not cat_items:
+                continue
+            
+            cat_name = CATEGORIES[cat_id]["name_es"]
+            add_line(cat_name)
             add_line("─" * 40)
-            for item in high_items:
+            
+            # Sort by priority within category
+            cat_items.sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.priority, 2))
+            
+            for item in cat_items:
                 self._render_item_with_links(item, idx, lines, hyperlinks, current_pos)
                 current_pos = sum(len(l) + 1 for l in lines)
                 idx += 1
             add_line("")
-        
-        if medium_items:
-            add_line("🟡 MEDIA PRIORIDAD")
-            add_line("─" * 40)
-            for item in medium_items:
-                self._render_item_with_links(item, idx, lines, hyperlinks, current_pos)
-                current_pos = sum(len(l) + 1 for l in lines)
-                idx += 1
-            add_line("")
-        
-        if low_items:
-            add_line("🟢 BAJA PRIORIDAD / APPS")
-            add_line("─" * 40)
-            for item in low_items:
-                self._render_item_with_links(item, idx, lines, hyperlinks, current_pos)
-                current_pos = sum(len(l) + 1 for l in lines)
-                idx += 1
         
         return "\n".join(lines), hyperlinks
 
@@ -194,21 +186,20 @@ class DeliveryAgent:
         def current_pos():
             return sum(len(l) + 1 for l in lines)
         
-        # Build tag indicators
+        # Build priority indicator
+        priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.priority, "")
+        
+        # Build special content indicators
         indicators = []
-        if item.has_company_news:
-            indicators.append("🏢")
-        if item.has_video:
-            indicators.append("🎬")
         if item.has_prompt:
             indicators.append("💡")
+        if item.has_video:
+            indicators.append("🎬")
         
         indicator_str = " ".join(indicators) + " " if indicators else ""
         
         lines.append("")
-        lines.append(f"{index}. {indicator_str}{item.topic.upper()}")
-        lines.append(f"   Tags: {', '.join(item.tags)}")
-        lines.append("")
+        lines.append(f"{index}. {priority_icon} {indicator_str}{item.topic.upper()}")
         lines.append(f"   {item.summary}")
         lines.append("")
         
@@ -226,42 +217,32 @@ class DeliveryAgent:
             return sum(len(l) + 1 for l in lines)
         
         sender_short = source.sender.split("<")[0].strip() if "<" in source.sender else source.sender
+        # Truncate long sender names
+        if len(sender_short) > 25:
+            sender_short = sender_short[:22] + "..."
         time_str = source.received_at.strftime("%m-%d %H:%M")
         
         lines.append(f"   ┌─ 📧 {sender_short} ({time_str})")
-        lines.append(f"   │  {source.summary}")
         
-        # Show prompt of the day COMPLETE
+        # Show prompt of the day COMPLETE (most valuable)
         if source.prompt_of_day:
-            lines.append(f"   │")
-            lines.append(f"   │  💡 PROMPT OF THE DAY:")
-            lines.append(f"   │  \"{source.prompt_of_day}\"")
+            prompt_clean = source.prompt_of_day[:200] + "..." if len(source.prompt_of_day) > 200 else source.prompt_of_day
+            lines.append(f"   │  💡 PROMPT: \"{prompt_clean}\"")
         
-        # Show company news
-        if source.company_news:
-            lines.append(f"   │")
-            lines.append(f"   │  🏢 NOTICIAS: {', '.join(source.company_news)}")
-        
-        # Show video links with hyperlinks
+        # Show video links with hyperlinks (high value)
         if source.video_links:
-            lines.append(f"   │")
-            lines.append(f"   │  🎬 VIDEOS:")
-            for i, vlink in enumerate(source.video_links[:3]):
+            for vlink in source.video_links[:2]:
                 pos = current_pos()
-                link_text = f"Ver video {i+1}"
-                prefix = f"   │     → "
-                # Calculate position of the link text
+                platform = "YouTube" if "youtu" in vlink.lower() else "Vimeo" if "vimeo" in vlink.lower() else "Video"
+                link_text = f"Ver en {platform}"
+                prefix = f"   │  🎬 "
                 start_idx = pos + len(prefix)
                 end_idx = start_idx + len(link_text)
                 hyperlinks.append((start_idx, end_idx, vlink))
                 lines.append(f"{prefix}{link_text}")
         
-        # Show apps to try (secondary)
-        if source.app_mentions:
-            lines.append(f"   │  📱 Apps: {', '.join(source.app_mentions)}")
-        
-        # Other links with hyperlinks
-        other_links = [l for l in source.extracted_links if l not in source.video_links][:3]
+        # Other useful links - max 2
+        other_links = [l for l in source.extracted_links if l not in source.video_links][:2]
         if other_links:
             pos = current_pos()
             prefix = "   │  🔗 "
@@ -273,7 +254,7 @@ class DeliveryAgent:
                     line_parts.append(" | ")
                     link_start += 3
                 
-                link_text = f"Link {i+1}"
+                link_text = self._get_link_label(link)
                 hyperlinks.append((link_start, link_start + len(link_text), link))
                 line_parts.append(link_text)
                 link_start += len(link_text)
@@ -282,10 +263,47 @@ class DeliveryAgent:
         
         # Email link as hyperlink
         pos = current_pos()
-        prefix = "   └─ 📌 "
+        prefix = "   └─ "
         link_text = "Ver email"
         start_idx = pos + len(prefix)
         end_idx = start_idx + len(link_text)
         hyperlinks.append((start_idx, end_idx, source.email_link))
         lines.append(f"{prefix}{link_text}")
-        lines.append("")
+
+    def _get_link_label(self, url: str) -> str:
+        """Extract a meaningful label from a URL"""
+        import re
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            # Remove www prefix
+            domain = re.sub(r'^www\.', '', domain)
+            # Known domains with better names
+            name_map = {
+                'github.com': 'GitHub',
+                'twitter.com': 'Twitter',
+                'x.com': 'X/Twitter',
+                'linkedin.com': 'LinkedIn',
+                'medium.com': 'Medium',
+                'substack.com': 'Substack',
+                'reddit.com': 'Reddit',
+                'techcrunch.com': 'TechCrunch',
+                'theverge.com': 'The Verge',
+                'arxiv.org': 'Paper',
+                'huggingface.co': 'HuggingFace',
+                'openai.com': 'OpenAI',
+                'anthropic.com': 'Anthropic',
+                'wired.com': 'Wired',
+                'nytimes.com': 'NYTimes',
+                'bloomberg.com': 'Bloomberg',
+                'reuters.com': 'Reuters',
+            }
+            for key, name in name_map.items():
+                if key in domain:
+                    return name
+            # Return first part of domain capitalized
+            base = domain.split('.')[0]
+            return base.capitalize() if len(base) > 2 else "Enlace"
+        except Exception:
+            return "Enlace"
