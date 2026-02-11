@@ -1,0 +1,10 @@
+label: newsletters
+max_messages: 50
+report:
+  language: bilingual
+  include_exec_summary: true
+schedule:
+  times:
+    - "08:30"
+    - "13:30"
+  timezone: US/Pacific

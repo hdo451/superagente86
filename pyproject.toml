@@ -1,0 +1,19 @@
+[project]
+name = "superagente86"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+dependencies = [
+  "google-api-python-client==2.153.0",
+  "google-auth-httplib2==0.2.0",
+  "google-auth-oauthlib==1.2.1",
+  "python-dotenv==1.0.1",
+  "PyYAML==6.0.2",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
