@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
@@ -11,6 +12,12 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 from .analysis_agent import Report, ReportItem, ReportSource
 from .config import ShortcutConfig
+
+
+@dataclass
+class HyperlinkMarker:
+    text: str
+    url: str
 
 
 class DeliveryAgent:
@@ -46,10 +53,30 @@ class DeliveryAgent:
         doc = service.documents().create(body={"title": title}).execute()
         doc_id = doc.get("documentId")
 
-        content = self._render_report(report)
+        # Build content and collect hyperlink positions
+        content, hyperlinks = self._render_report_with_links(report)
+        
+        # Insert text first
         requests = [
             {"insertText": {"location": {"index": 1}, "text": content}}
         ]
+        
+        # Add hyperlink formatting requests
+        # Links need to be applied in reverse order to preserve positions
+        for start_idx, end_idx, url in reversed(hyperlinks):
+            requests.append({
+                "updateTextStyle": {
+                    "range": {
+                        "startIndex": start_idx + 1,  # +1 because doc starts at index 1
+                        "endIndex": end_idx + 1,
+                    },
+                    "textStyle": {
+                        "link": {"url": url}
+                    },
+                    "fields": "link"
+                }
+            })
+        
         service.documents().batchUpdate(
             documentId=doc_id, body={"requests": requests}
         ).execute()
@@ -93,17 +120,37 @@ class DeliveryAgent:
         )
 
     def _render_report(self, report: Report) -> str:
+        content, _ = self._render_report_with_links(report)
+        return content
+
+    def _render_report_with_links(self, report: Report) -> Tuple[str, List[Tuple[int, int, str]]]:
+        """Returns (content_text, list of (start_idx, end_idx, url))"""
         lines = []
-        lines.append(f"📰 REPORTE DE NEWSLETTERS")
-        lines.append(f"   {report.generated_at.strftime('%Y-%m-%d %H:%M')}")
-        lines.append("")
+        hyperlinks: List[Tuple[int, int, str]] = []
+        current_pos = 0
+        
+        def add_line(text: str):
+            nonlocal current_pos
+            lines.append(text)
+            current_pos += len(text) + 1  # +1 for newline
+        
+        def add_link(display_text: str, url: str):
+            nonlocal current_pos
+            start = current_pos
+            end = start + len(display_text)
+            hyperlinks.append((start, end, url))
+            return display_text
+        
+        add_line("📰 REPORTE DE NEWSLETTERS")
+        add_line(f"   {report.generated_at.strftime('%Y-%m-%d %H:%M')}")
+        add_line("")
         
         if report.executive_summary_es or report.executive_summary_en:
-            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("📊 RESUMEN EJECUTIVO")
-            lines.append(f"   {report.executive_summary_es}")
-            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("")
+            add_line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            add_line("📊 RESUMEN EJECUTIVO")
+            add_line(f"   {report.executive_summary_es}")
+            add_line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            add_line("")
         
         # Group by priority
         high_items = [i for i in report.items if i.priority == "high"]
@@ -112,31 +159,41 @@ class DeliveryAgent:
         
         idx = 1
         if high_items:
-            lines.append("🔴 ALTA PRIORIDAD")
-            lines.append("─" * 40)
+            add_line("🔴 ALTA PRIORIDAD")
+            add_line("─" * 40)
             for item in high_items:
-                lines.extend(self._render_item(item, idx))
+                self._render_item_with_links(item, idx, lines, hyperlinks, current_pos)
+                current_pos = sum(len(l) + 1 for l in lines)
                 idx += 1
-            lines.append("")
+            add_line("")
         
         if medium_items:
-            lines.append("🟡 MEDIA PRIORIDAD")
-            lines.append("─" * 40)
+            add_line("🟡 MEDIA PRIORIDAD")
+            add_line("─" * 40)
             for item in medium_items:
-                lines.extend(self._render_item(item, idx))
+                self._render_item_with_links(item, idx, lines, hyperlinks, current_pos)
+                current_pos = sum(len(l) + 1 for l in lines)
                 idx += 1
-            lines.append("")
+            add_line("")
         
         if low_items:
-            lines.append("🟢 BAJA PRIORIDAD / APPS")
-            lines.append("─" * 40)
+            add_line("🟢 BAJA PRIORIDAD / APPS")
+            add_line("─" * 40)
             for item in low_items:
-                lines.extend(self._render_item(item, idx))
+                self._render_item_with_links(item, idx, lines, hyperlinks, current_pos)
+                current_pos = sum(len(l) + 1 for l in lines)
                 idx += 1
         
-        return "\n".join(lines)
+        return "\n".join(lines), hyperlinks
 
-    def _render_item(self, item: ReportItem, index: int) -> List[str]:
+    def _render_item_with_links(
+        self, item: ReportItem, index: int, 
+        lines: List[str], hyperlinks: List[Tuple[int, int, str]], 
+        base_pos: int
+    ):
+        def current_pos():
+            return sum(len(l) + 1 for l in lines)
+        
         # Build tag indicators
         indicators = []
         if item.has_company_news:
@@ -148,30 +205,31 @@ class DeliveryAgent:
         
         indicator_str = " ".join(indicators) + " " if indicators else ""
         
-        lines = [
-            f"",
-            f"{index}. {indicator_str}{item.topic.upper()}",
-            f"   Tags: {', '.join(item.tags)}",
-            f"",
-            f"   {item.summary}",
-            f"",
-        ]
+        lines.append("")
+        lines.append(f"{index}. {indicator_str}{item.topic.upper()}")
+        lines.append(f"   Tags: {', '.join(item.tags)}")
+        lines.append("")
+        lines.append(f"   {item.summary}")
+        lines.append("")
         
         # Render sources with their special content
         for source in item.sources:
-            lines.extend(self._render_source(source))
-        
-        lines.append("")
-        return lines
+            self._render_source_with_links(source, lines, hyperlinks)
 
-    def _render_source(self, source: ReportSource) -> List[str]:
+        lines.append("")
+
+    def _render_source_with_links(
+        self, source: ReportSource, 
+        lines: List[str], hyperlinks: List[Tuple[int, int, str]]
+    ):
+        def current_pos():
+            return sum(len(l) + 1 for l in lines)
+        
         sender_short = source.sender.split("<")[0].strip() if "<" in source.sender else source.sender
         time_str = source.received_at.strftime("%m-%d %H:%M")
         
-        lines = [
-            f"   ┌─ 📧 {sender_short} ({time_str})",
-            f"   │  {source.summary}",
-        ]
+        lines.append(f"   ┌─ 📧 {sender_short} ({time_str})")
+        lines.append(f"   │  {source.summary}")
         
         # Show prompt of the day COMPLETE
         if source.prompt_of_day:
@@ -184,23 +242,50 @@ class DeliveryAgent:
             lines.append(f"   │")
             lines.append(f"   │  🏢 NOTICIAS: {', '.join(source.company_news)}")
         
-        # Show video links prominently
+        # Show video links with hyperlinks
         if source.video_links:
             lines.append(f"   │")
             lines.append(f"   │  🎬 VIDEOS:")
-            for vlink in source.video_links[:3]:
-                lines.append(f"   │     → {vlink}")
+            for i, vlink in enumerate(source.video_links[:3]):
+                pos = current_pos()
+                link_text = f"Ver video {i+1}"
+                prefix = f"   │     → "
+                # Calculate position of the link text
+                start_idx = pos + len(prefix)
+                end_idx = start_idx + len(link_text)
+                hyperlinks.append((start_idx, end_idx, vlink))
+                lines.append(f"{prefix}{link_text}")
         
         # Show apps to try (secondary)
         if source.app_mentions:
             lines.append(f"   │  📱 Apps: {', '.join(source.app_mentions)}")
         
-        # Other links (compact)
+        # Other links with hyperlinks
         other_links = [l for l in source.extracted_links if l not in source.video_links][:3]
         if other_links:
-            lines.append(f"   │  🔗 Links: {' | '.join(other_links[:2])}{'...' if len(other_links) > 2 else ''}")
+            pos = current_pos()
+            prefix = "   │  🔗 "
+            line_parts = [prefix]
+            link_start = pos + len(prefix)
+            
+            for i, link in enumerate(other_links):
+                if i > 0:
+                    line_parts.append(" | ")
+                    link_start += 3
+                
+                link_text = f"Link {i+1}"
+                hyperlinks.append((link_start, link_start + len(link_text), link))
+                line_parts.append(link_text)
+                link_start += len(link_text)
+            
+            lines.append("".join(line_parts))
         
-        lines.append(f"   └─ 📌 Email: {source.email_link}")
+        # Email link as hyperlink
+        pos = current_pos()
+        prefix = "   └─ 📌 "
+        link_text = "Ver email"
+        start_idx = pos + len(prefix)
+        end_idx = start_idx + len(link_text)
+        hyperlinks.append((start_idx, end_idx, source.email_link))
+        lines.append(f"{prefix}{link_text}")
         lines.append("")
-        
-        return lines
