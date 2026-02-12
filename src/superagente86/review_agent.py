@@ -68,7 +68,7 @@ DOCUMENT TO REVIEW:
             return self._parse_response(response.text)
         except Exception as e:
             return ReviewFeedback(
-                is_good=True,
+                is_good=False,
                 issues=[f"Review error: {str(e)}"],
                 suggestions=[],
                 summary="Could not complete review"
@@ -110,7 +110,7 @@ If there are no issues, write "None" under ISSUES.
             return self._parse_response(response.text)
         except Exception as e:
             return ReviewFeedback(
-                is_good=True,
+                is_good=False,
                 issues=[f"Visual review error: {str(e)}"],
                 suggestions=[],
                 summary="Could not complete visual review"
