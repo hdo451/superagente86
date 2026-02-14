@@ -9,6 +9,7 @@ PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_PYTHON="${PROJECT_DIR}/.venv/bin/python"
 LOG_DIR="${PROJECT_DIR}/logs"
+ENV_FILE="${PROJECT_DIR}/.env"
 
 mkdir -p "$LOG_DIR"
 
@@ -17,6 +18,28 @@ if [ ! -f "$VENV_PYTHON" ]; then
     echo "Run: python3 -m venv .venv && .venv/bin/pip install -e ."
     exit 1
 fi
+
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Error: .env file not found at ${ENV_FILE}"
+    echo "Please create .env with GEMINI_API_KEY and other credentials"
+    exit 1
+fi
+
+# Build environment variables dict from .env file
+ENV_VARS=""
+while IFS='=' read -r key value; do
+    # Skip comments and empty lines
+    [[ "$key" =~ ^#.*$ ]] && continue
+    [[ -z "$key" ]] && continue
+    
+    # Remove quotes if present
+    value="${value%\"}"
+    value="${value#\"}"
+    
+    ENV_VARS+="        <key>${key}</key>
+        <string>${value}</string>
+"
+done < "$ENV_FILE"
 
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -45,7 +68,13 @@ cat > "$PLIST_PATH" <<EOF
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
+${ENV_VARS}    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
 
     <key>StartCalendarInterval</key>
     <array>
@@ -78,9 +107,10 @@ launchctl bootout "gui/$(id -u)/${PLIST_NAME}" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 
 echo "✅ Schedule installed!"
-echo "   Reports will run at 08:30 and 13:30 daily."
+echo "   Reports will run at 08:30 and 13:30 daily (US/Pacific)."
+echo "   Catch-up enabled: runs at login and every 30 minutes if missed."
 echo "   Plist: ${PLIST_PATH}"
 echo "   Logs:  ${LOG_DIR}/"
 echo ""
-echo "To uninstall: launchctl bootout gui/$(id -u)/${PLIST_NAME}"
 echo "To check status: launchctl print gui/$(id -u)/${PLIST_NAME}"
+echo "To uninstall: launchctl bootout gui/$(id -u)/${PLIST_NAME}"

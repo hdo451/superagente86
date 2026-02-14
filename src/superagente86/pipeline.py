@@ -108,12 +108,14 @@ class Pipeline:
         review_feedback = None
         doc_id = None
         shortcut_path = None
-        
-        if self._review.enabled:
+
+        if not report.items:
+            self._logger.info("No news items found; skipping review and document creation")
+        elif self._review.enabled:
             content_preview = self._delivery._render_report(report)
             review_feedback = self._review.review_document_text(content_preview)
             self._logger.info(f"📋 Document review: {'✅ PASS' if review_feedback.is_good else '❌ FAIL'}")
-            
+
             if not review_feedback.is_good:
                 self._logger.warning(f"Review issues: {review_feedback.issues}")
                 self._logger.warning(f"Suggestions: {review_feedback.suggestions}")
@@ -129,7 +131,9 @@ class Pipeline:
             self._logger.info("Review disabled (no API key configured)")
 
         # Only create document if review passed or is disabled
-        if not dry_run and (not self._review.enabled or review_feedback.is_good):
+        if not report.items:
+            self._logger.info("Document creation skipped: no news items")
+        elif not dry_run and (not self._review.enabled or review_feedback.is_good):
             try:
                 doc_id = self._delivery.create_report_doc(report, title_prefix=title_prefix)
                 self._logger.info(f"📄 Document created: {doc_id}")

@@ -23,17 +23,21 @@ class ReviewAgent:
         self._api_key = api_key or os.getenv("GEMINI_API_KEY")
         if self._api_key:
             genai.configure(api_key=self._api_key)
-            self._model = genai.GenerativeModel("gemini-2.5-flash")
+            self._model_names = [
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
+                "gemini-flash-latest",
+            ]
         else:
-            self._model = None
+            self._model_names = []
 
     @property
     def enabled(self) -> bool:
-        return self._model is not None
+        return bool(self._model_names)
 
     def review_document_text(self, content: str) -> ReviewFeedback:
         """Review document content as text (cheaper, faster)"""
-        if not self._model:
+        if not self._model_names:
             return ReviewFeedback(
                 is_good=True,
                 issues=[],
@@ -64,8 +68,8 @@ If there are no issues, write "None" under ISSUES.
 DOCUMENT TO REVIEW:
 """
         try:
-            response = self._model.generate_content(prompt + content[:8000])
-            return self._parse_response(response.text)
+            response_text = self._generate_text(prompt + content[:8000])
+            return self._parse_response(response_text)
         except Exception as e:
             return ReviewFeedback(
                 is_good=False,
@@ -76,7 +80,7 @@ DOCUMENT TO REVIEW:
 
     def review_document_image(self, image_bytes: bytes) -> ReviewFeedback:
         """Review document as image (visual analysis)"""
-        if not self._model:
+        if not self._model_names:
             return ReviewFeedback(
                 is_good=True,
                 issues=[],
@@ -106,8 +110,8 @@ If there are no issues, write "None" under ISSUES.
 """
         try:
             image = Image.open(io.BytesIO(image_bytes))
-            response = self._model.generate_content([prompt, image])
-            return self._parse_response(response.text)
+            response_text = self._generate_image(prompt, image)
+            return self._parse_response(response_text)
         except Exception as e:
             return ReviewFeedback(
                 is_good=False,
@@ -115,6 +119,40 @@ If there are no issues, write "None" under ISSUES.
                 suggestions=[],
                 summary="Could not complete visual review"
             )
+
+    def _generate_text(self, prompt: str) -> str:
+        last_error: Exception | None = None
+        for model_name in self._model_names:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt)
+                return response.text
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if "not found" in err_str or "limit: 0" in err_str or "Quota exceeded" in err_str:
+                    continue
+                break
+        if last_error:
+            raise last_error
+        raise RuntimeError("No Gemini models configured")
+
+    def _generate_image(self, prompt: str, image: Image.Image) -> str:
+        last_error: Exception | None = None
+        for model_name in self._model_names:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content([prompt, image])
+                return response.text
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if "not found" in err_str or "limit: 0" in err_str or "Quota exceeded" in err_str:
+                    continue
+                break
+        if last_error:
+            raise last_error
+        raise RuntimeError("No Gemini models configured")
 
     def _parse_response(self, text: str) -> ReviewFeedback:
         lines = text.strip().split("\n")

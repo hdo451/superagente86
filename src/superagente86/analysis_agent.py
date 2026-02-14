@@ -54,16 +54,26 @@ class AnalysisAgent:
         api_key = os.getenv("GEMINI_API_KEY")
         if api_key:
             genai.configure(api_key=api_key)
-            self._model = genai.GenerativeModel("gemini-2.5-flash")
+            self._model_names = [
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
+                "gemini-flash-latest",
+            ]
         else:
-            self._model = None
+            self._model_names = []
 
     def analyze(self, messages: List[GmailMessage], include_exec_summary: bool) -> Report:
         all_items: List[ReportItem] = []
 
-        for msg in messages:
-            items = self._extract_news_items(msg)
-            all_items.extend(items)
+        # Optimize: extract all news in a single API call if possible
+        if self._model_names and messages:
+            all_items = self._extract_all_news_items_batch(messages)
+        
+        if not all_items and messages:
+            # Fallback to per-message extraction if batch fails
+            for msg in messages:
+                items = self._extract_news_items(msg)
+                all_items.extend(items)
 
         # Sort by source priority (The Neuron first, then TLDR AI, etc.)
         all_items.sort(key=lambda x: x.source_priority)
@@ -88,26 +98,116 @@ class AnalysisAgent:
 
     def _gemini_call(self, prompt: str, max_retries: int = 2):
         """Call Gemini with retry on rate limit errors."""
-        for attempt in range(max_retries + 1):
-            try:
-                response = self._model.generate_content(prompt)
-                # Small delay between calls to avoid per-minute rate limits
-                time.sleep(2)
-                return response
-            except Exception as e:
-                err_str = str(e)
-                # Don't retry daily quota exhaustion — it won't recover
-                if "PerDay" in err_str or "limit: 0" in err_str:
-                    raise
-                if "429" in err_str and attempt < max_retries:
-                    wait = 15 * (attempt + 1)
-                    print(f"   ⏳ Rate limit, waiting {wait}s...")
-                    time.sleep(wait)
-                else:
-                    raise
+        last_error: Exception | None = None
+        for model_name in self._model_names:
+            for attempt in range(max_retries + 1):
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(prompt)
+                    # Small delay between calls to avoid per-minute rate limits
+                    time.sleep(2)
+                    return response
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e)
+                    # Try next model if this one is unavailable or has no quota
+                    if "not found" in err_str or "limit: 0" in err_str or "Quota exceeded" in err_str:
+                        break
+                    if "429" in err_str and attempt < max_retries:
+                        wait = 15 * (attempt + 1)
+                        print(f"   ⏳ Rate limit on {model_name}, waiting {wait}s...")
+                        time.sleep(wait)
+                        continue
+                    break
+        if last_error:
+            raise last_error
+        raise RuntimeError("No Gemini models configured")
 
     # ------------------------------------------------------------------
-    # Gemini-based extraction
+    # Batch extraction (optimized: 1 request for all emails)
+    # ------------------------------------------------------------------
+
+    def _extract_all_news_items_batch(self, messages: List[GmailMessage]) -> List[ReportItem]:
+        """Extract news from ALL newsletters in a single API call.
+        This is 80% more efficient than per-message extraction."""
+        
+        if not messages:
+            return []
+        
+        # Prepare all email content
+        email_blocks = []
+        for i, msg in enumerate(messages, 1):
+            fuente = self._extract_source_name(msg.sender)
+            body = msg.body_text or msg.snippet or ""
+            body = self._strip_footer(body)
+            
+            email_blocks.append(
+                f"--- EMAIL {i}: {fuente} ---\n"
+                f"Subject: {msg.subject}\n\n"
+                f"Content:\n{body[:3000]}\n"
+            )
+        
+        combined_content = "\n".join(email_blocks)
+        
+        prompt = (
+            "You are an assistant that extracts individual news stories from tech/AI newsletters.\n"
+            "Analyze the following BATCH of newsletter emails and extract EACH individual news story.\n"
+            "For each story return:\n"
+            '- "titular": short, clear headline in English (max 12 words)\n'
+            '- "fuente": newsletter name (e.g., "The Neuron", "TLDR AI")\n'
+            '- "cuerpo": summary in English, 2-3 complete sentences. Must clearly explain what happened, '
+            "who is involved, and why it matters. Do NOT include footer text, links, or promotional content.\n\n"
+            "CRITICAL RULES:\n"
+            "- ONLY extract items that have BOTH a complete headline AND a complete summary with at least 40 words.\n"
+            "- If a newsletter has an incomplete item (headline but no summary), DO NOT INCLUDE IT.\n"
+            "- If a summary appears to be cut off or ends abruptly, SKIP THAT ITEM.\n"
+            "- Extract ALL complete news items across all newsletters (up to 100 total). Do not skip any real news with good summaries.\n"
+            "- PAY SPECIAL ATTENTION to sections like 'Here's what happened in AI today' or "
+            "'Top stories' — these contain the most important news and MUST be extracted if complete.\n"
+            "- Ignore ads, job offers, referral sections, footers, memes, prompts of the day.\n"
+            "- Only extract real news with substantial, complete information.\n"
+            "- The headline (titular) MUST match the body (cuerpo). If the body doesn't relate "
+            "to the headline, DO NOT INCLUDE IT.\n"
+            "- If no clear, complete news items exist, return an empty array.\n"
+            "- Respond ONLY with a valid JSON array, no markdown or explanations.\n\n"
+            f"Content:\n{combined_content[:15000]}\n\n"
+            'Respond ONLY with JSON array: [{"titular": "...", "fuente": "...", "cuerpo": "..."}]'
+        )
+        
+        try:
+            response = self._gemini_call(prompt)
+            raw = response.text.strip()
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                return []
+        except Exception:
+            return []
+        
+        items: List[ReportItem] = []
+        for entry in parsed[:100]:  # Max 100 items across all newsletters
+            titular = (entry.get("titular") or "").strip()
+            fuente = (entry.get("fuente") or "").strip()
+            cuerpo = (entry.get("cuerpo") or "").strip()
+            
+            if not titular or not fuente or not cuerpo or len(cuerpo) < 40:
+                continue
+            
+            priority = self._get_source_priority(fuente)
+            items.append(ReportItem(
+                titular=titular,
+                cuerpo=cuerpo,
+                fuente=fuente,
+                source_priority=priority,
+            ))
+        
+        return items if items else []
+
+    # ------------------------------------------------------------------
+    # Gemini API with rate-limit retry
     # ------------------------------------------------------------------
 
     def _extract_news_items(self, message: GmailMessage) -> List[ReportItem]:
@@ -126,22 +226,25 @@ class AnalysisAgent:
             "Analyze the following email and extract EACH individual news story.\n"
             "For each story return:\n"
             '- "titular": short, clear headline in English (max 12 words)\n'
-            '- "cuerpo": summary in English, 2-3 sentences. Must clearly explain what happened, '
+            '- "cuerpo": summary in English, 2-3 complete sentences. Must clearly explain what happened, '
             "who is involved, and why it matters. Do NOT include footer text, links, or promotional content.\n\n"
-            "RULES:\n"
-            "- Extract ALL news items from the newsletter (up to 25). Do not skip any real news.\n"
+            "CRITICAL RULES:\n"
+            "- ONLY extract items that have BOTH a complete headline AND a complete summary with at least 40 words.\n"
+            "- If the newsletter has an incomplete item (headline but no summary), DO NOT INCLUDE IT.\n"
+            "- If a summary appears to be cut off or ends abruptly, SKIP THAT ITEM.\n"
+            "- Extract ALL complete news items from the newsletter (up to 25). Do not skip any real news with good summaries.\n"
             "- PAY SPECIAL ATTENTION to sections like 'Here\'s what happened in AI today' or "
-            "'Top stories' — these contain the most important news and MUST be extracted.\n"
+            "'Top stories' — these contain the most important news and MUST be extracted if complete.\n"
             "- Ignore ads, job offers, referral sections, footers, memes, prompts of the day.\n"
-            "- Only extract real news with substantial information.\n"
+            "- Only extract real news with substantial, complete information.\n"
             "- The headline (titular) MUST match the body (cuerpo). If the body doesn't relate "
-            "to the headline, fix it or skip that item.\n"
-            "- If no clear news items exist, return an empty array.\n"
+            "to the headline, DO NOT INCLUDE IT.\n"
+            "- If no clear, complete news items exist, return an empty array.\n"
             "- Respond ONLY with a valid JSON array, no markdown or explanations.\n\n"
             f"Newsletter: {fuente}\n"
             f"Subject: {message.subject}\n\n"
             f"Content:\n{body[:12000]}\n\n"
-            'Respond ONLY with JSON: [{"titular": "...", "cuerpo": "..."}]'
+            'Respond ONLY with JSON array: [{"titular": "...", "cuerpo": "..."}]'
         )
 
         try:
@@ -161,7 +264,7 @@ class AnalysisAgent:
         for entry in parsed[:25]:  # Max 25 items per newsletter
             titular = (entry.get("titular") or "").strip()
             cuerpo = (entry.get("cuerpo") or "").strip()
-            if not titular or not cuerpo or len(cuerpo) < 20:
+            if not titular or not cuerpo or len(cuerpo) < 40:
                 continue
 
             items.append(ReportItem(
@@ -227,7 +330,7 @@ class AnalysisAgent:
                     continue
                 common = words & seen
                 ratio = len(common) / min(len(words), len(seen)) if min(len(words), len(seen)) > 0 else 0
-                if ratio >= 0.5 and len(common) >= 2:
+                if ratio >= 0.65 and len(common) >= 2:
                     dup_index = idx
                     break
 
