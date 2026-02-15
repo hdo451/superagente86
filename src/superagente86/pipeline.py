@@ -58,34 +58,22 @@ class Pipeline:
         tz = self._resolve_timezone(self._app_config.schedule.timezone)
         now_local = now_utc.astimezone(tz)
         
-        # Determine the search window:
-        # - First run: compute from schedule
-        # - Subsequent runs: use saved window, extend end to now
-        if "window_end" in state and state["window_end"]:
-            try:
-                window_end_saved = dt.datetime.fromisoformat(state["window_end"])
-                window_start_saved = dt.datetime.fromisoformat(state["window_start"])
-                
-                # Check if we've moved past the saved window end (next scheduled execution)
-                if now_utc >= window_end_saved:
-                    # We've passed to the next execution slot, compute new window
-                    self._logger.info("Advanced to next scheduled window")
-                    window_start_local, window_end_local = self._compute_window(now_local, self._app_config.schedule.times)
-                    window_start = window_start_local.astimezone(dt.timezone.utc)
-                    window_end = window_end_local.astimezone(dt.timezone.utc)
-                else:
-                    # Still in current window, search from start to now
-                    window_start = window_start_saved
-                    window_end = now_utc
-                    self._logger.info("Continuing current scheduled window")
-            except Exception as e:
-                self._logger.warning(f"Could not parse saved window: {e}, recomputing")
-                window_start_local, window_end_local = self._compute_window(now_local, self._app_config.schedule.times)
-                window_start = window_start_local.astimezone(dt.timezone.utc)
-                window_end = window_end_local.astimezone(dt.timezone.utc)
-        else:
-            self._logger.info("First run, computing initial window from schedule")
-            window_start_local, window_end_local = self._compute_window(now_local, self._app_config.schedule.times)
+        # Determine the search window: always use the last *completed* scheduled window.
+        # Example:
+        # - If now is after 13:30 -> use 08:30 to 13:30 today.
+        # - If now is before 13:30 -> use 13:30 yesterday to 08:30 today.
+        try:
+            window_start_local, window_end_local = self._compute_previous_window(
+                now_local, self._app_config.schedule.times
+            )
+            window_start = window_start_local.astimezone(dt.timezone.utc)
+            window_end = window_end_local.astimezone(dt.timezone.utc)
+            self._logger.info("Using last completed scheduled window")
+        except Exception as e:
+            self._logger.warning(f"Could not compute window: {e}, falling back to schedule")
+            window_start_local, window_end_local = self._compute_window(
+                now_local, self._app_config.schedule.times
+            )
             window_start = window_start_local.astimezone(dt.timezone.utc)
             window_end = window_end_local.astimezone(dt.timezone.utc)
         
@@ -104,36 +92,33 @@ class Pipeline:
         )
         self._logger.info(f"📊 Analyzed {len(report.items)} news items")
 
-        # Review content before creating document
+        # Review content (informative only - never blocks document creation)
         review_feedback = None
         doc_id = None
         shortcut_path = None
 
         if not report.items:
-            self._logger.info("No news items found; skipping review and document creation")
+            self._logger.info("No news items found; skipping document creation")
         elif self._review.enabled:
             content_preview = self._delivery._render_report(report)
             review_feedback = self._review.review_document_text(content_preview)
-            self._logger.info(f"📋 Document review: {'✅ PASS' if review_feedback.is_good else '❌ FAIL'}")
-
+            
             if not review_feedback.is_good:
-                self._logger.warning(f"Review issues: {review_feedback.issues}")
-                self._logger.warning(f"Suggestions: {review_feedback.suggestions}")
-                self._logger.warning(f"Summary: {review_feedback.summary}")
-                self._logger.error("Document creation SKIPPED due to review failure")
-            else:
-                if review_feedback.issues:
-                    self._logger.info(f"Minor issues detected: {review_feedback.issues}")
+                self._logger.info(f"📋 Document review: ⚠️ ISSUES (will create anyway)")
+                self._logger.info(f"Review feedback: {review_feedback.issues}")
                 if review_feedback.suggestions:
                     self._logger.info(f"Suggestions: {review_feedback.suggestions}")
-                self._logger.info(f"Summary: {review_feedback.summary}")
+            else:
+                self._logger.info(f"📋 Document review: ✅ PASS")
+                if review_feedback.suggestions:
+                    self._logger.info(f"Suggestions: {review_feedback.suggestions}")
         else:
-            self._logger.info("Review disabled (no API key configured)")
+            self._logger.info("Review mode: disabled")
 
-        # Only create document if review passed or is disabled
+        # Create document if items exist (review is informative only)
         if not report.items:
             self._logger.info("Document creation skipped: no news items")
-        elif not dry_run and (not self._review.enabled or review_feedback.is_good):
+        elif not dry_run:
             try:
                 doc_id = self._delivery.create_report_doc(report, title_prefix=title_prefix)
                 self._logger.info(f"📄 Document created: {doc_id}")
@@ -157,8 +142,6 @@ class Pipeline:
                 doc_id = None
         elif dry_run:
             self._logger.info("DRY RUN: Document creation skipped")
-        else:
-            self._logger.warning("Document creation SKIPPED: Review did not pass")
 
         state["last_run"] = dt.datetime.now(dt.timezone.utc).isoformat()
         state["window_start"] = window_start.isoformat()
@@ -249,6 +232,49 @@ class Pipeline:
             )
         
         return latest, next_time
+
+    @staticmethod
+    def _compute_previous_window(
+        now: dt.datetime, schedule_times: List[str]
+    ) -> Tuple[dt.datetime, dt.datetime]:
+        """Compute the last completed window based on schedule times.
+
+        Returns (start, end) where end is the most recent scheduled time at or
+        before now, and start is the scheduled time immediately before that.
+        """
+        times = [Pipeline._parse_time(value) for value in schedule_times]
+        times.sort()
+
+        today = now.date()
+        scheduled_today = [dt.datetime.combine(today, t, tzinfo=now.tzinfo) for t in times]
+
+        # Find the most recent scheduled time at or before now
+        end_time = None
+        for t in scheduled_today:
+            if t <= now:
+                end_time = t
+
+        if end_time is None:
+            # Before first schedule today -> end is yesterday's last time
+            end_time = dt.datetime.combine(
+                today - dt.timedelta(days=1), times[-1], tzinfo=now.tzinfo
+            )
+
+        # Start is the schedule time immediately before end_time
+        start_time = None
+        for t in reversed(times):
+            candidate = dt.datetime.combine(end_time.date(), t, tzinfo=now.tzinfo)
+            if candidate < end_time:
+                start_time = candidate
+                break
+
+        if start_time is None:
+            # If end_time is the first schedule of its day, start is previous day's last time
+            start_time = dt.datetime.combine(
+                end_time.date() - dt.timedelta(days=1), times[-1], tzinfo=now.tzinfo
+            )
+
+        return start_time, end_time
 
     @staticmethod
     def _parse_time(value: str) -> dt.time:

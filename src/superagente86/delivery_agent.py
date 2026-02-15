@@ -140,7 +140,26 @@ class DeliveryAgent:
                 body={"requests": style_requests},
             ).execute()
 
+        # --- Step 6: Share document with "anyone with link can view" ---
+        self._share_document(doc_id, creds)
+
         return doc_id
+
+    def _share_document(self, doc_id: str, creds: Credentials) -> None:
+        """Share document with 'anyone with the link can view' permission."""
+        try:
+            drive_service = build("drive", "v3", credentials=creds)
+            drive_service.permissions().create(
+                fileId=doc_id,
+                body={
+                    "type": "anyone",
+                    "role": "reader",
+                }
+            ).execute()
+        except Exception as e:
+            # Log but don't fail the entire pipeline if sharing fails
+            import logging
+            logging.warning(f"Could not share document {doc_id}: {e}")
 
     # ------------------------------------------------------------------
     # Table helpers

@@ -7,7 +7,7 @@ schedule:
   times:
     - "08:30"
     - "13:30"
-  timezone: US/Pacific
+  timezone: local
 shortcut:
   enabled: true
   name_prefix: "Reporte diario AI"

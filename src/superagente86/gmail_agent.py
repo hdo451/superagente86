@@ -21,6 +21,7 @@ class GmailMessage:
     received_at: dt.datetime
     snippet: str
     body_text: str
+    body_html: str  # NEW: Store raw HTML for better extraction
     link: str
     links: List[str]
 
@@ -94,7 +95,8 @@ class GmailAgent:
                 else dt.datetime.now(dt.timezone.utc)
             )
 
-            body_text = self._extract_body(payload)
+            body_text = self._extract_body(payload, mime_type="text/plain")
+            body_html = self._extract_body(payload, mime_type="text/html")
             links = self._extract_links(payload)
             messages.append(
                 GmailMessage(
@@ -104,23 +106,35 @@ class GmailAgent:
                     received_at=received_at,
                     snippet=raw.get("snippet", ""),
                     body_text=body_text,
+                    body_html=body_html,
                     link=f"https://mail.google.com/mail/u/0/#inbox/{message_id}",
                     links=links,
                 )
             )
         return messages
 
-    def _extract_body(self, payload: dict) -> str:
+    def _extract_body(self, payload: dict, mime_type: str = "text/plain") -> str:
+        """Extract body in specified MIME type.
+        If not found, falls back to the other type."""
         if "parts" in payload:
             parts = payload.get("parts", [])
+            # First try to find the requested mime type
             for part in parts:
-                if part.get("mimeType") == "text/plain":
-                    return self._decode_body(part.get("body", {}).get("data"))
+                if part.get("mimeType") == mime_type:
+                    data = part.get("body", {}).get("data")
+                    text = self._decode_body(data)
+                    if mime_type == "text/html":
+                        return text  # Return raw HTML, don't strip
+                    return text
+            # Fallback: try the other type
+            fallback_type = "text/html" if mime_type == "text/plain" else "text/plain"
             for part in parts:
-                if part.get("mimeType") == "text/html":
-                    return self._strip_html(
-                        self._decode_body(part.get("body", {}).get("data"))
-                    )
+                if part.get("mimeType") == fallback_type:
+                    text = self._decode_body(part.get("body", {}).get("data"))
+                    if fallback_type == "text/html":
+                        return self._html_to_clean_text(text)  # Clean HTML if falling back
+                    return text
+        # Direct body (not multipart)
         data = payload.get("body", {}).get("data")
         return self._decode_body(data)
 
@@ -206,6 +220,7 @@ class GmailAgent:
 
     @staticmethod
     def _strip_html(text: str) -> str:
+        """Legacy: Simple HTML stripper. Use _html_to_clean_text() for better results."""
         stripped = []
         skip = False
         for char in text:
@@ -218,3 +233,38 @@ class GmailAgent:
             if not skip:
                 stripped.append(char)
         return "".join(stripped)
+
+    @staticmethod
+    def _html_to_clean_text(html: str) -> str:
+        """Convert HTML to clean text while preserving structure.
+        - Remove script/style tags
+        - Remove HTML tags
+        - Normalize whitespace
+        - Preserve line breaks from block elements"""
+        import re
+        
+        # Remove script and style elements
+        html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Add newlines before block-level elements to preserve structure
+        block_elements = ['</div>', '</p>', '</h[1-6]>', '</li>', '</table>', '</tr>', '</td>']
+        for elem in block_elements:
+            html = re.sub(elem, elem + '\n', html, flags=re.IGNORECASE)
+        
+        # Remove remaining HTML tags
+        html = re.sub(r'<[^>]+>', '', html)
+        
+        # Decode HTML entities
+        html = html.replace('&nbsp;', ' ')
+        html = html.replace('&lt;', '<')
+        html = html.replace('&gt;', '>')
+        html = html.replace('&amp;', '&')
+        html = html.replace('&quot;', '"')
+        html = html.replace('&#39;', "'")
+        
+        # Normalize whitespace
+        lines = [line.strip() for line in html.split('\n')]
+        lines = [line for line in lines if line]  # Remove empty lines
+        
+        return '\n'.join(lines)

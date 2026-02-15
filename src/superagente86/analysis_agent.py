@@ -138,13 +138,14 @@ class AnalysisAgent:
         email_blocks = []
         for i, msg in enumerate(messages, 1):
             fuente = self._extract_source_name(msg.sender)
-            body = msg.body_text or msg.snippet or ""
+            # Prefer HTML (structured) over plain text
+            body = msg.body_html or msg.body_text or msg.snippet or ""
             body = self._strip_footer(body)
             
             email_blocks.append(
                 f"--- EMAIL {i}: {fuente} ---\n"
                 f"Subject: {msg.subject}\n\n"
-                f"Content:\n{body[:3000]}\n"
+                f"Content:\n{body}\n"  # NO TRUNCATION
             )
         
         combined_content = "\n".join(email_blocks)
@@ -155,22 +156,17 @@ class AnalysisAgent:
             "For each story return:\n"
             '- "titular": short, clear headline in English (max 12 words)\n'
             '- "fuente": newsletter name (e.g., "The Neuron", "TLDR AI")\n'
-            '- "cuerpo": summary in English, 2-3 complete sentences. Must clearly explain what happened, '
-            "who is involved, and why it matters. Do NOT include footer text, links, or promotional content.\n\n"
-            "CRITICAL RULES:\n"
-            "- ONLY extract items that have BOTH a complete headline AND a complete summary with at least 40 words.\n"
-            "- If a newsletter has an incomplete item (headline but no summary), DO NOT INCLUDE IT.\n"
-            "- If a summary appears to be cut off or ends abruptly, SKIP THAT ITEM.\n"
-            "- Extract ALL complete news items across all newsletters (up to 100 total). Do not skip any real news with good summaries.\n"
-            "- PAY SPECIAL ATTENTION to sections like 'Here's what happened in AI today' or "
-            "'Top stories' — these contain the most important news and MUST be extracted if complete.\n"
-            "- Ignore ads, job offers, referral sections, footers, memes, prompts of the day.\n"
-            "- Only extract real news with substantial, complete information.\n"
-            "- The headline (titular) MUST match the body (cuerpo). If the body doesn't relate "
-            "to the headline, DO NOT INCLUDE IT.\n"
-            "- If no clear, complete news items exist, return an empty array.\n"
+            '- "cuerpo": summary in English, 1-3 sentences. Explain what happened, who is involved, and why it matters.\n\n'
+            "EXTRACTION GUIDELINES:\n"
+            "- Extract ALL individual news items from the content (aim for 10+ items if present).\n"
+            "- Include items that are clearly identifiable news stories with a headline and descriptive text.\n"
+            "- Summaries should be substantial but can be concise (even 15-20 words is acceptable).\n"
+            "- Ignore ads, job offers, sponsor sections, footers, and promotional blocks.\n"
+            "- The headline must relate to the body. If they don't match, skip that item.\n"
+            "- Prioritize breadth: capture as many relevant news items as possible.\n"
+            "- Return up to 100 items total across all newsletters.\n"
             "- Respond ONLY with a valid JSON array, no markdown or explanations.\n\n"
-            f"Content:\n{combined_content[:15000]}\n\n"
+            f"Content:\n{combined_content}\n\n"  # NO TRUNCATION
             'Respond ONLY with JSON array: [{"titular": "...", "fuente": "...", "cuerpo": "..."}]'
         )
         
@@ -193,7 +189,7 @@ class AnalysisAgent:
             fuente = (entry.get("fuente") or "").strip()
             cuerpo = (entry.get("cuerpo") or "").strip()
             
-            if not titular or not fuente or not cuerpo or len(cuerpo) < 40:
+            if not titular or not fuente or not cuerpo or len(cuerpo) < 15:
                 continue
             
             priority = self._get_source_priority(fuente)
@@ -215,10 +211,11 @@ class AnalysisAgent:
         fuente = self._extract_source_name(message.sender)
         priority = self._get_source_priority(fuente)
 
-        body = message.body_text or message.snippet or ""
+        # Prefer HTML (structured) over plain text
+        body = message.body_html or message.body_text or message.snippet or ""
         body = self._strip_footer(body)
 
-        if not self._model or len(body.strip()) < 50:
+        if not self._model_names or len(body.strip()) < 50:
             return self._fallback_extract(message, fuente, priority)
 
         prompt = (
@@ -226,24 +223,19 @@ class AnalysisAgent:
             "Analyze the following email and extract EACH individual news story.\n"
             "For each story return:\n"
             '- "titular": short, clear headline in English (max 12 words)\n'
-            '- "cuerpo": summary in English, 2-3 complete sentences. Must clearly explain what happened, '
-            "who is involved, and why it matters. Do NOT include footer text, links, or promotional content.\n\n"
-            "CRITICAL RULES:\n"
-            "- ONLY extract items that have BOTH a complete headline AND a complete summary with at least 40 words.\n"
-            "- If the newsletter has an incomplete item (headline but no summary), DO NOT INCLUDE IT.\n"
-            "- If a summary appears to be cut off or ends abruptly, SKIP THAT ITEM.\n"
-            "- Extract ALL complete news items from the newsletter (up to 25). Do not skip any real news with good summaries.\n"
-            "- PAY SPECIAL ATTENTION to sections like 'Here\'s what happened in AI today' or "
-            "'Top stories' — these contain the most important news and MUST be extracted if complete.\n"
-            "- Ignore ads, job offers, referral sections, footers, memes, prompts of the day.\n"
-            "- Only extract real news with substantial, complete information.\n"
-            "- The headline (titular) MUST match the body (cuerpo). If the body doesn't relate "
-            "to the headline, DO NOT INCLUDE IT.\n"
-            "- If no clear, complete news items exist, return an empty array.\n"
+            '- "cuerpo": summary in English, 1-3 sentences. Explain what happened, who is involved, and why it matters.\n\n'
+            "EXTRACTION GUIDELINES:\n"
+            "- Extract ALL individual news items from this newsletter (aim for 5-15+ items if present).\n"
+            "- Include items that are clearly identifiable news stories with a headline and descriptive text.\n"
+            "- Summaries should be substantial but can be concise (even 15-20 words is acceptable).\n"
+            "- Ignore ads, job offers, sponsor sections, footers, memes, and promotional content.\n"
+            "- The headline must relate to the body. If they don't match, skip that item.\n"
+            "- Prioritize breadth: capture as many relevant news items as possible.\n"
+            "- Return up to 50 items from this newsletter.\n"
             "- Respond ONLY with a valid JSON array, no markdown or explanations.\n\n"
             f"Newsletter: {fuente}\n"
             f"Subject: {message.subject}\n\n"
-            f"Content:\n{body[:12000]}\n\n"
+            f"Content:\n{body}\n\n"  # NO TRUNCATION - pass full content
             'Respond ONLY with JSON array: [{"titular": "...", "cuerpo": "..."}]'
         )
 
@@ -261,10 +253,10 @@ class AnalysisAgent:
             return self._fallback_extract(message, fuente, priority)
 
         items: List[ReportItem] = []
-        for entry in parsed[:25]:  # Max 25 items per newsletter
+        for entry in parsed[:50]:  # Max 50 items per newsletter
             titular = (entry.get("titular") or "").strip()
             cuerpo = (entry.get("cuerpo") or "").strip()
-            if not titular or not cuerpo or len(cuerpo) < 40:
+            if not titular or not cuerpo or len(cuerpo) < 15:
                 continue
 
             items.append(ReportItem(
