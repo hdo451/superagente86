@@ -77,7 +77,8 @@ def load_google_config() -> GoogleConfig:
         "https://www.googleapis.com/auth/gmail.modify"
     ]
     docs_scopes = os.getenv("DOCS_SCOPES", "").split() or [
-        "https://www.googleapis.com/auth/documents"
+        "https://www.googleapis.com/auth/documents",
+        "https://www.googleapis.com/auth/drive.file"  # Required for sharing
     ]
 
     return GoogleConfig(

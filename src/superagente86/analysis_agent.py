@@ -322,7 +322,8 @@ class AnalysisAgent:
                     continue
                 common = words & seen
                 ratio = len(common) / min(len(words), len(seen)) if min(len(words), len(seen)) > 0 else 0
-                if ratio >= 0.65 and len(common) >= 2:
+                # Lower threshold to 50% for more aggressive deduplication
+                if ratio >= 0.50 and len(common) >= 2:
                     dup_index = idx
                     break
 
