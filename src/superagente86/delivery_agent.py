@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -19,6 +22,21 @@ class DeliveryAgent:
         self._credentials_path = credentials_path
         self._token_path = token_path
         self._scopes = scopes
+        self._max_retries = 10  # Ultra-resilient retries (~17 minutes total wait)
+
+    def _execute_with_retries(self, func, *args, **kwargs):
+        """Execute a function with exponential backoff + jitter retries."""
+        for attempt in range(self._max_retries):
+            try:
+                return func(*args, **kwargs)
+            except (HttpError, TimeoutError, OSError) as e:
+                if attempt < self._max_retries - 1:
+                    base_wait = min(2 ** attempt, 512)
+                    jitter = random.uniform(0, base_wait * 0.3)
+                    wait_time = base_wait + jitter
+                    time.sleep(wait_time)
+                else:
+                    raise
 
     def _get_credentials(self) -> Credentials:
         creds = None
@@ -48,7 +66,9 @@ class DeliveryAgent:
         service = build("docs", "v1", credentials=creds)
 
         title = f"{title_prefix} {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        doc = service.documents().create(body={"title": title}).execute()
+        doc = self._execute_with_retries(
+            lambda: service.documents().create(body={"title": title}).execute()
+        )
         doc_id = doc["documentId"]
 
         items = report.items
@@ -64,31 +84,40 @@ class DeliveryAgent:
             header_text += f"{report.executive_summary}\n"
         header_text += "\n"
 
-        service.documents().batchUpdate(
-            documentId=doc_id,
-            body={"requests": [
-                {"insertText": {"location": {"index": 1}, "text": header_text}},
-            ]},
-        ).execute()
+        self._execute_with_retries(
+            lambda: service.documents().batchUpdate(
+                documentId=doc_id,
+                body={"requests": [
+                    {"insertText": {"location": {"index": 1}, "text": header_text}},
+                ]},
+            ).execute()
+        )
 
-        # Read doc to find end position, then insert table there
-        doc_struct = service.documents().get(documentId=doc_id).execute()
+        # Read doc to find end position
+        doc_struct = self._execute_with_retries(
+            lambda: service.documents().get(documentId=doc_id).execute()
+        )
         body_content = doc_struct["body"]["content"]
         table_insert_idx = body_content[-1]["endIndex"] - 1
 
-        service.documents().batchUpdate(
-            documentId=doc_id,
-            body={"requests": [
-                {"insertTable": {
-                    "rows": num_rows,
-                    "columns": num_cols,
-                    "location": {"index": table_insert_idx},
-                }},
-            ]},
-        ).execute()
+        # Insert table
+        self._execute_with_retries(
+            lambda: service.documents().batchUpdate(
+                documentId=doc_id,
+                body={"requests": [
+                    {"insertTable": {
+                        "rows": num_rows,
+                        "columns": num_cols,
+                        "location": {"index": table_insert_idx},
+                    }},
+                ]},
+            ).execute()
+        )
 
-        # --- Step 2: Read back document to get cell indices ---
-        doc_struct = service.documents().get(documentId=doc_id).execute()
+        # Read back document to get cell indices
+        doc_struct = self._execute_with_retries(
+            lambda: service.documents().get(documentId=doc_id).execute()
+        )
         cell_indices = self._extract_cell_indices(doc_struct)
 
         # --- Step 3: Build cell data ---
@@ -104,8 +133,6 @@ class DeliveryAgent:
         all_rows = [header_row] + data_rows
 
         # --- Step 4: Insert text into cells in REVERSE order ---
-        # This is critical: inserting text shifts all subsequent indices,
-        # so we must go from the last cell to the first.
         insert_requests = []
         for row_idx in range(len(all_rows) - 1, -1, -1):
             for col_idx in range(num_cols - 1, -1, -1):
@@ -125,20 +152,25 @@ class DeliveryAgent:
             # Google Docs API limit per batch is ~500 requests; chunk if needed
             for chunk_start in range(0, len(insert_requests), 400):
                 chunk = insert_requests[chunk_start:chunk_start + 400]
-                service.documents().batchUpdate(
-                    documentId=doc_id,
-                    body={"requests": chunk},
-                ).execute()
+                self._execute_with_retries(
+                    lambda: service.documents().batchUpdate(
+                        documentId=doc_id,
+                        body={"requests": chunk},
+                    ).execute()
+                )
 
         # --- Step 5: Style the header row (bold) ---
-        # Re-read to get updated indices after text insertion
-        doc_struct = service.documents().get(documentId=doc_id).execute()
+        doc_struct = self._execute_with_retries(
+            lambda: service.documents().get(documentId=doc_id).execute()
+        )
         style_requests = self._build_header_style_requests(doc_struct)
         if style_requests:
-            service.documents().batchUpdate(
-                documentId=doc_id,
-                body={"requests": style_requests},
-            ).execute()
+            self._execute_with_retries(
+                lambda: service.documents().batchUpdate(
+                    documentId=doc_id,
+                    body={"requests": style_requests},
+                ).execute()
+            )
 
         # --- Step 6: Share document with "anyone with link can view" ---
         self._share_document(doc_id, creds)
@@ -149,13 +181,15 @@ class DeliveryAgent:
         """Share document with 'anyone with the link can view' permission."""
         try:
             drive_service = build("drive", "v3", credentials=creds)
-            drive_service.permissions().create(
-                fileId=doc_id,
-                body={
-                    "type": "anyone",
-                    "role": "reader",
-                }
-            ).execute()
+            self._execute_with_retries(
+                lambda: drive_service.permissions().create(
+                    fileId=doc_id,
+                    body={
+                        "type": "anyone",
+                        "role": "reader",
+                    }
+                ).execute()
+            )
         except Exception as e:
             # Log but don't fail the entire pipeline if sharing fails
             import logging

@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 .env
 token.json
+token.json.backup
 credentials.json
 data/state.json
+logs/*.log

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import random
 import re
+import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import List, Optional
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -67,22 +70,53 @@ class GmailAgent:
         if before_ts:
             query += f" before:{int(before_ts.timestamp())}"
 
-        response = (
-            service.users()
-            .messages()
-            .list(userId="me", q=query, maxResults=max_results)
-            .execute()
-        )
+        # ULTRA-RESILIENT: 10 attempts with exponential backoff + jitter
+        # Max delays: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 512s
+        # Total ~17 minutes of waiting if all retries fail
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                response = (
+                    service.users()
+                    .messages()
+                    .list(userId="me", q=query, maxResults=max_results)
+                    .execute()
+                )
+                break
+            except (HttpError, TimeoutError, OSError) as e:
+                if attempt < max_retries - 1:
+                    base_wait = min(2 ** attempt, 60)  # Cap at 60s
+                    jitter = random.uniform(0, base_wait * 0.3)
+                    wait_time = base_wait + jitter
+                    print(f"⚠️  Gmail timeout, waiting {wait_time:.1f}s... ({attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    print(f"❌ Gmail API failed after {max_retries} attempts")
+                    raise
+        
         message_ids = [msg["id"] for msg in response.get("messages", [])]
 
         messages: List[GmailMessage] = []
         for message_id in message_ids:
-            raw = (
-                service.users()
-                .messages()
-                .get(userId="me", id=message_id, format="full")
-                .execute()
-            )
+            # Retry for individual messages too
+            for attempt in range(max_retries):
+                try:
+                    raw = (
+                        service.users()
+                        .messages()
+                        .get(userId="me", id=message_id, format="full")
+                        .execute()
+                    )
+                    break
+                except (HttpError, TimeoutError, OSError) as e:
+                    if attempt < max_retries - 1:
+                        base_wait = min(2 ** attempt, 60)
+                        jitter = random.uniform(0, base_wait * 0.3)
+                        wait_time = base_wait + jitter
+                        time.sleep(wait_time)
+                    else:
+                        raise
+            
             payload = raw.get("payload", {})
             headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
 
@@ -209,14 +243,27 @@ class GmailAgent:
         creds = self._get_credentials()
         service = build("gmail", "v1", credentials=creds)
         
-        # Use batch modify to mark all as read
-        service.users().messages().batchModify(
-            userId="me",
-            body={
-                "ids": message_ids,
-                "removeLabelIds": ["UNREAD"]
-            }
-        ).execute()
+        # Ultra-resilient retry logic
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                # Use batch modify to mark all as read
+                service.users().messages().batchModify(
+                    userId="me",
+                    body={
+                        "ids": message_ids,
+                        "removeLabelIds": ["UNREAD"]
+                    }
+                ).execute()
+                break
+            except (HttpError, TimeoutError, OSError) as e:
+                if attempt < max_retries - 1:
+                    base_wait = min(2 ** attempt, 60)
+                    jitter = random.uniform(0, base_wait * 0.3)
+                    wait_time = base_wait + jitter
+                    time.sleep(wait_time)
+                else:
+                    raise
 
     @staticmethod
     def _strip_html(text: str) -> str:
